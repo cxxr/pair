@@ -4,7 +4,7 @@ A Claude Code mod that turns Claude into a pair-programming partner: neither of 
 
 - **Edit review.** Every `Edit` and `Write` is held until you decide on it, beside its diff.
 - **Shared notebook.** A running list of what you have decided and what is still open, which both of you can update.
-- **Collaboration instructions.** The bundled `collaborate` skill is attached to every prompt you send, so Claude explains before it asks, proposes before it builds, and works in small steps.
+- **Collaboration instructions.** The bundled `collaborate` skill is sent to Claude once per session, with your first prompt, so Claude explains before it asks, proposes before it builds, and works in small steps.
 - **One switch.** `/pair` turns all of it on or off.
 
 ## Requirements
@@ -72,15 +72,17 @@ Claude adds and resolves entries through its own `notebook` tool.
 - `/pair on` and `/pair off` set it.
 - `/pair status` says which it is and which skill file is in use.
 
-With pair mode off, edits run without review, your prompts go as typed, and the notebook band is hidden. An edit that is being held when you turn it off goes ahead. The setting lasts for the session; a new session starts with pair mode on.
+With pair mode off, edits run without review, Claude is told to work as it normally would, and the notebook band is hidden. An edit that is being held when you turn it off goes ahead. The setting lasts for the session; a new session starts with pair mode on.
 
 ### Review size target
 
-`maxReviewLines` (default 40) is how many changed lines one edit should stay under. Change it in `/config`. Claude is told the target with every prompt, a review over it says so, and `Split` sends an oversized edit back. New files show their size without the warning.
+`maxReviewLines` (default 40) is how many changed lines one edit should stay under. Change it in `/config`. Claude is told the target along with the instructions, a review over it says so, and `Split` sends an oversized edit back. New files show their size without the warning.
 
 ### The collaborate skill
 
-The instructions Claude follows live in [`skills/collaborate/SKILL.md`](skills/collaborate/SKILL.md). To use your own version, put it at `~/.claude/skills/collaborate/SKILL.md`; that copy wins over the bundled one. The file is read each time you send a prompt, so edits take effect immediately.
+The instructions Claude follows live in [`skills/collaborate/SKILL.md`](skills/collaborate/SKILL.md). To use your own version, put it at `~/.claude/skills/collaborate/SKILL.md`; that copy wins over the bundled one.
+
+The instructions go to Claude once per session, with the first prompt you send while pair mode is on. Sending them with every prompt would pile up copies in the conversation. They are sent again with your next prompt after Claude Code compacts the conversation or you run `/clear`, since either one removes them. To put them in front of Claude again yourself, for instance after editing the file or late in a long session, run the skill itself: `/pair:collaborate` for the bundled copy, or `/collaborate` if you keep your own.
 
 ### Whole file
 

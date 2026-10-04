@@ -109,6 +109,13 @@ const command = ($: Engine, name: string, args = '') =>
 const submit = ($: Engine, text: string, kind: 'composer' | 'task-notification' = 'composer') =>
   $.prompt.submit({ text, wait: false, origin: { kind } })
 
+// Where the mod looks for the skill it ships, read off what `/pair status` asks for.
+const shippedSkillPath = async ($: Engine, asked: string[]) => {
+  await command($, 'pair', 'status')
+
+  return asked.find(path => path.endsWith('/skills/collaborate/SKILL.md') && !path.startsWith(HOME)) ?? ''
+}
+
 const gatePane = ($: Engine, surface: 'terminal' | 'desktop' = 'terminal') =>
   $.ui.mount({ plugin: 'pair', surface, component: 'Pane', requestId: GATE, props: PANE })
 
@@ -393,21 +400,27 @@ describe('edit gate', () => {
 })
 
 describe('/pair', () => {
-  test('off lets edits through and leaves prompts as typed; on restores both', async ($, on) => {
+  test('off lets edits through and sends no instructions; on restores both', async ($, on) => {
     const { clock, ran, prompts } = world(on, { ...SOURCE, [SKILL_PATH]: SKILL_TEXT })
 
-    expect((await command($, 'pair', 'off')).text).toMatch(/Pair mode is off/)
+    const off = await command($, 'pair', 'off')
+    expect(off.text).toMatch(/Pair mode is off/)
+    expect(off.context?.[0]).toMatch(/turned pair mode off/)
     expect(
       await $.tool.call({ tool: 'Edit', file_path: FILE, old_string: 'const a = 1', new_string: 'const count = 1' }),
     ).toMatchObject({ result: 'ran' })
     await submit($, 'hello')
     expect(prompts.at(-1)).toEqual({ text: 'hello', context: undefined })
 
-    expect((await command($, 'pair')).text).toMatch(/Pair mode is on/)
+    const back = await command($, 'pair')
+    expect(back.text).toMatch(/Pair mode is on/)
+    expect(back.context?.[0]).toMatch(/turned pair mode on/)
     const { outcome } = await heldEdit($, clock)
     expect(outcome()).toBe('held')
     expect(ran.filter(e => e.tool === 'Edit')).toHaveLength(1)
     await (await gatePane($)).press({ key: 'skip' })
+    await submit($, 'again')
+    expect(prompts.at(-1)?.context?.[0]).toStartWith('# Collaborate')
   })
 
   test('turning it off releases an edit that is being held', async ($, on) => {
@@ -421,8 +434,8 @@ describe('/pair', () => {
     expect(answer.context).toBeUndefined()
   })
 
-  test('each prompt carries the skill body, read when the prompt is sent', async ($, on) => {
-    const { prompts, files } = world(on, { [SKILL_PATH]: SKILL_TEXT })
+  test('the first prompt of a session carries the skill body, and later ones carry nothing', async ($, on) => {
+    const { prompts } = world(on, { [SKILL_PATH]: SKILL_TEXT })
 
     await submit($, 'add a cache')
     const [first] = prompts.at(-1)?.context ?? []
@@ -431,9 +444,42 @@ describe('/pair', () => {
     expect(first).not.toContain('description: Pair up.')
     expect(first).toContain('mcp__pair__explain_edit')
 
-    files[SKILL_PATH] = '---\nname: collaborate\n---\nAlways ask first.\n'
     await submit($, 'and a test')
-    expect(prompts.at(-1)?.context?.[0]).toStartWith('Always ask first.')
+    expect(prompts.at(-1)).toEqual({ text: 'and a test', context: undefined })
+  })
+
+  test('after a compaction the next prompt carries the instructions again', async ($, on) => {
+    const messages = [{ role: 'user' as const, text: 'a summary', toolUses: [] }]
+    on('session.compact', () => ({ messages }))
+    const { prompts } = world(on, { [SKILL_PATH]: SKILL_TEXT })
+    const carried = async (text: string) => {
+      await submit($, text)
+
+      return prompts.at(-1)?.context !== undefined
+    }
+
+    expect(await carried('first')).toBe(true)
+    expect(await carried('second')).toBe(false)
+
+    await $.session.compact({ trigger: 'precompute', messages })
+    expect(await carried('after a precompute')).toBe(false)
+
+    await $.session.compact({ trigger: 'auto', messages })
+    expect(await carried('after a compaction')).toBe(true)
+    expect(await carried('and the one after')).toBe(false)
+  })
+
+  test('after a /clear the next prompt carries the instructions again', async ($, on) => {
+    on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
+    const { prompts } = world(on, { [SKILL_PATH]: SKILL_TEXT })
+
+    await submit($, 'first')
+    await submit($, 'second')
+    expect(prompts.at(-1)?.context).toBeUndefined()
+
+    await $.session.end({ reason: 'clear', sessionId: 'sess', resume: { id: 'sess' } })
+    await submit($, 'after a clear')
+    expect(prompts.at(-1)?.context?.[0]).toStartWith('# Collaborate')
   })
 
   test('a prompt the person did not type is left alone', async ($, on) => {
@@ -446,16 +492,20 @@ describe('/pair', () => {
 
   test('the skill the plugin ships is used when the person has none of their own', async ($, on) => {
     const { prompts, files, asked } = world(on, {})
+    const shipped = await shippedSkillPath($, asked)
+    expect(shipped).not.toBe('')
+
+    files[shipped] = SKILL_TEXT
+    await submit($, 'hello')
+    expect(prompts.at(-1)?.context?.[0]).toStartWith('# Collaborate')
+  })
+
+  test("the person's own copy of the skill wins over the shipped one", async ($, on) => {
+    const { prompts, files, asked } = world(on, {})
+    files[await shippedSkillPath($, asked)] = SKILL_TEXT
+    files[SKILL_PATH] = '---\nname: collaborate\n---\nMy own rules.\n'
 
     await submit($, 'hello')
-    const shipped = asked.find(path => path.endsWith('/skills/collaborate/SKILL.md') && !path.startsWith(HOME)) ?? ''
-    expect(shipped).not.toBe('')
-    files[shipped] = SKILL_TEXT
-    await submit($, 'again')
-    expect(prompts.at(-1)?.context?.[0]).toStartWith('# Collaborate')
-
-    files[SKILL_PATH] = '---\nname: collaborate\n---\nMy own rules.\n'
-    await submit($, 'once more')
     expect(prompts.at(-1)?.context?.[0]).toStartWith('My own rules.')
   })
 

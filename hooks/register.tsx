@@ -658,6 +658,23 @@ export const register: Register = (on, options) => {
     return { text: await changeNotebook($, request) }
   })
 
+  // A compaction or a /clear takes the instructions out of the conversation,
+  // so the next prompt carries them again.
+  on('session.compact', async ($, e, next) => {
+    const done = await next(e)
+    if (done.skip === undefined && e.trigger !== 'precompute' && e.agentId === undefined) {
+      await update($, hasSentInstructions, () => false)
+    }
+
+    return done
+  })
+
+  on('session.end', async ($, e, next) => {
+    await update($, hasSentInstructions, () => false)
+
+    return next(e)
+  })
+
   on('prompt.submit', async ($, e, next) => {
     const isPersons = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
     // Once a session: sent with every prompt, the copies pile up in the conversation.
