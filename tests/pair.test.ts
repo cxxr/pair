@@ -527,6 +527,39 @@ describe('/pair', () => {
   })
 })
 
+describe('/pair help', () => {
+  test('lists every command and button, and the settings as they are', { options: { maxReviewLines: 12, editor: 'zed' } }, async ($, on) => {
+    world(on, { [SKILL_PATH]: SKILL_TEXT })
+
+    const { text = '' } = await command($, 'pair', 'help')
+
+    expect(text).toStartWith('Pair programming with Claude. Pair mode is on.')
+    for (const line of [
+      '/pair on | off',
+      '/pair status',
+      '1  Approve',
+      '2  Discuss',
+      '3  Skip',
+      '4  Wide view',
+      '5  Whole file',
+      '6  Split',
+      'Esc',
+      '/pair drive [files]    take over: your files are noted and your editor (zed) opens',
+      '/pair review [note]',
+      '/notebook resolve <id> [answer]',
+      `In use: ${SKILL_PATH}`,
+      'Review size target     12 changed lines (maxReviewLines)',
+      'Editor command         zed (editor)',
+    ]) {
+      expect(text).toContain(line)
+    }
+
+    await command($, 'pair', 'off')
+    expect((await command($, 'pair', 'help')).text).toContain('Pair mode is off.')
+    expect((await command($, 'pair', 'nonsense')).text).toContain('/pair help explains each.')
+  })
+})
+
 describe('taking over', () => {
   test('drive opens the editor, and review sends Claude what was typed with the note', async ($, on) => {
     const { clock, files, commands, prompts } = world(on, SOURCE)

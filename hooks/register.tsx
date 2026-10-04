@@ -672,6 +672,54 @@ const review = async (
   }
 }
 
+const helpText = (isPairOn: boolean, skillPath: string | undefined): string =>
+  [
+    `Pair programming with Claude. Pair mode is ${isPairOn ? 'on' : 'off'}.`,
+    '',
+    'Mode',
+    '  /pair                  turn pair mode on or off',
+    '  /pair on | off         set it',
+    '  /pair status           say which it is and which skill file is in use',
+    '  /pair help             show this',
+    '',
+    'When Claude edits (pair mode on)',
+    '  Every Edit and Write waits for you in a review showing its reason, size and diff.',
+    '  1  Approve             run the edit as written',
+    '  2  Discuss             refuse it; Claude explains its reasoning and waits for you',
+    '  3  Skip                refuse it; Claude drops it',
+    '  4  Wide view           more lines around each change and a wider pane; press again to go back',
+    '  5  Whole file          compare the whole file side by side in VS Code',
+    '  6  Split               refuse it; Claude sends it again as smaller steps',
+    '  Esc                    refuse it; Claude waits for you in the chat',
+    '  The keys work while the review has the keyboard. Otherwise click a button, or press ctrl+x tab first.',
+    '',
+    'When you edit',
+    `  /pair drive [files]    take over: your files are noted and your editor (${editor}) opens`,
+    '  /pair review [note]    hand back: Claude reviews what you changed, with your note',
+    '  A file can be a path, a name on its own, start with ~, or come from the @ file picker.',
+    '  With no files: everything in the git repository, or outside one the files Claude has edited.',
+    '',
+    'Notebook',
+    '  /notebook                         show it in a pane',
+    '  /notebook decided <text>          add a decision',
+    '  /notebook open <text>             add an open question',
+    '  /notebook resolve <id> [answer]   move a question to Decided',
+    '  /notebook edit <id> <text>        change an entry',
+    '  /notebook remove <id>             delete an entry',
+    '  /notebook clear                   delete every entry',
+    '',
+    'Instructions',
+    '  The collaborate skill goes to Claude once a session, and again after a compaction or /clear.',
+    `  In use: ${skillPath ?? 'none found'}`,
+    '  To send it again yourself, run the skill: /collaborate, or /pair:collaborate for the bundled copy.',
+    '',
+    'Settings, changed in /config',
+    `  Review size target     ${maxLines} changed lines (maxReviewLines)`,
+    `  Editor command         ${editor} (editor)`,
+    '',
+    'Only Edit and Write are held. Bash and other tools can still change files.',
+  ].join('\n')
+
 export const register: Register = (on, options) => {
   if (typeof options.maxReviewLines === 'number' && options.maxReviewLines >= 1) {
     maxLines = Math.floor(options.maxReviewLines)
@@ -684,7 +732,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'pair',
       description: 'Turn pairing mode on or off, or take over the typing and have Claude review it',
-      argumentHint: '[on|off|status | drive [files] | review [note]]',
+      argumentHint: '[on|off|status|help | drive [files] | review [note]]',
       immediate: true,
     })
     await $.command.register({
@@ -823,6 +871,9 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'pair' }, async ($, e) => {
     const [verb = '', ...rest] = e.args.trim().split(/\s+/)
+    if (verb.toLowerCase() === 'help') {
+      return { text: helpText(await read($, isOn), (await loadSkill($))?.path) }
+    }
     if (verb.toLowerCase() === 'drive') {
       return startDrive($, rest.join(' '))
     }
@@ -843,7 +894,7 @@ export const register: Register = (on, options) => {
       }
     }
     if (word !== '' && word !== 'on' && word !== 'off') {
-      return { text: 'Usage: /pair [on|off|status] | drive [files] | review [note]' }
+      return { text: 'Usage: /pair [on|off|status|help] | drive [files] | review [note]. /pair help explains each.' }
     }
 
     const isNowOn = await update($, isOn, was => (word === '' ? !was : word === 'on'))

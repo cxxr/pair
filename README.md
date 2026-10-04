@@ -72,6 +72,7 @@ Claude adds and resolves entries through its own `notebook` tool.
 - `/pair` flips pair mode.
 - `/pair on` and `/pair off` set it.
 - `/pair status` says which it is and which skill file is in use.
+- `/pair help` lists every command, review button and setting, with the settings as they currently are.
 
 With pair mode off, edits run without review, Claude is told to work as it normally would, and the notebook band is hidden. An edit that is being held when you turn it off goes ahead. The setting lasts for the session; a new session starts with pair mode on.
 
