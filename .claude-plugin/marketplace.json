@@ -1,0 +1,16 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "cxxr",
+  "description": "The pair mod for Claude Code",
+  "owner": { "name": "Sean Cassidy" },
+  "plugins": [
+    {
+      "name": "pair",
+      "description": "Pair programming: edits wait for your review, a shared notebook tracks decisions, and /pair switches the mode on or off.",
+      "author": { "name": "Sean Cassidy" },
+      "source": "./",
+      "category": "development",
+      "homepage": "https://github.com/cxxr/pair"
+    }
+  ]
+}

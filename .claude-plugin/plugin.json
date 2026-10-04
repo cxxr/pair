@@ -1,0 +1,19 @@
+{
+  "name": "pair",
+  "version": "0.1.0",
+  "description": "Pair programming: edits wait for your review, a shared notebook tracks decisions, and /pair switches the mode on or off.",
+  "author": { "name": "Sean Cassidy" },
+  "license": "MIT",
+  "homepage": "https://github.com/cxxr/pair",
+  "repository": "https://github.com/cxxr/pair",
+  "keywords": ["pair-programming", "review", "diff", "collaboration"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "maxReviewLines": {
+      "type": "number",
+      "title": "Review size target",
+      "description": "How many changed lines one edit should stay under. Claude is told to keep to it, and a review over it says so and can be sent back with Split.",
+      "default": 40
+    }
+  }
+}
