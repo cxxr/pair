@@ -5,6 +5,7 @@ A Claude Code mod that turns Claude into a pair-programming partner: neither of 
 - **Edit review.** Every `Edit` and `Write` is held until you decide on it, beside its diff.
 - **Shared notebook.** A running list of what you have decided and what is still open, which both of you can update.
 - **Collaboration instructions.** The bundled `collaborate` skill is sent to Claude once per session, with your first prompt, so Claude explains before it asks, proposes before it builds, and works in small steps.
+- **Taking over.** `/pair drive` hands you the keyboard, and `/pair review` has Claude review what you typed.
 - **One switch.** `/pair` turns all of it on or off.
 
 ## Requirements
@@ -74,6 +75,29 @@ Claude adds and resolves entries through its own `notebook` tool.
 
 With pair mode off, edits run without review, Claude is told to work as it normally would, and the notebook band is hidden. An edit that is being held when you turn it off goes ahead. The setting lasts for the session; a new session starts with pair mode on.
 
+### Taking over
+
+Sometimes you want to type a change yourself and have Claude review it.
+
+1. `/pair drive [files]`: you take over. The mod notes how your files stand and opens your editor on the files you named, or on the project folder.
+2. Type and save in your editor, for as long as you like.
+3. `/pair review [note]`: you hand back. Claude is sent what changed since step 1, along with your note, and reviews it: what the change does, bugs, risks, and anything unclear. It is told not to rewrite your work; any fix it proposes is an edit like any other and goes through the review.
+
+For example:
+
+```
+/pair review I added a test, but I don't think it covers all the options. Can you suggest more?
+```
+
+How the mod knows what you changed:
+
+- **In a git repository** (the one holding the files you named, or the session's folder if you named none) it compares a snapshot of the whole work tree taken at `/pair drive` with one taken at `/pair review`. Untracked files are included, ignored files are not, and changes you already had before driving are left out. Your index, branches and files are not touched; the snapshots are written as unreferenced objects in the repository, which git cleans up on its own.
+- **Anywhere else** it watches the files you name plus the files Claude has edited this session, so name the files: `/pair drive src/heap.py`.
+
+Naming files is forgiving. A path can be relative to the session's folder, start with `~`, or be just a file name: `/pair drive heap.py` looks for a file of that name under the session's folder, near the top first, and tells you if there are several. A leading `@` is ignored, so you can complete a path with the file picker.
+
+The editor is VS Code by default. To use another, set `editor` in `/config` to a command that opens files and returns at once, such as `cursor`, `zed` or `idea`.
+
 ### Review size target
 
 `maxReviewLines` (default 40) is how many changed lines one edit should stay under. Change it in `/config`. Claude is told the target along with the instructions, a review over it says so, and `Split` sends an oversized edit back. New files show their size without the warning.
@@ -103,6 +127,7 @@ The instructions go to Claude once per session, with the first prompt you send w
 
 - Reads `HOME` and `TMPDIR` to find the skill file and the temp folder.
 - Reads the file an edit targets, to draw its diff.
+- Runs `git`, `cp` and your editor command when you use `/pair drive` and `/pair review`. The `git` commands read the repository and write snapshot objects through a temporary index; they do not change your index, branches or files.
 - Runs `mkdir` and `code` when you press Whole file, and `rm -rf` on its own temp folder when you decide an edit you opened that way or when the mod starts and finds leftovers.
 - Lets Claude call the mod's own two tools, `explain_edit` and `notebook`, without a permission prompt. They only change the mod's own session state.
 

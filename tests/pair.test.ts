@@ -29,7 +29,12 @@ const band = (bodyColumns: number) => ({
 
 // The engine beneath the mod: files, a terminal, and tools and programs that
 // record what ran. `code` on PATH fails, so the launcher inside the app is used.
-const world = (on: On, initial: Record<string, string>, isPanePlaced = true) => {
+const world = (
+  on: On,
+  initial: Record<string, string>,
+  isPanePlaced = true,
+  programs?: (argv: readonly string[]) => { exitCode?: number; stdout?: string } | undefined,
+) => {
   const clock = mock.clock(on)
   mock.env(on, { HOME, TMPDIR: '/tmp/t/' })
   const files = { ...initial }
@@ -58,10 +63,12 @@ const world = (on: On, initial: Record<string, string>, isPanePlaced = true) => 
       }
     }
 
+    const answer = programs?.(e.argv)
+
     return {
       value: {
-        exitCode: program === 'code' ? 127 : 0,
-        stdout: '',
+        exitCode: answer?.exitCode ?? (program === 'code' ? 127 : 0),
+        stdout: answer?.stdout ?? '',
         stderr: '',
         isStdoutTruncated: false,
         isStderrTruncated: false,
@@ -69,6 +76,7 @@ const world = (on: On, initial: Record<string, string>, isPanePlaced = true) => 
     }
   })
   on('session.id', () => ({ value: 'sess' }))
+  on('session.cwd', () => ({ value: '/work' }))
   on('session.surfaces', () => ({ value: ['terminal'] as const }))
   on('ui.open', (_$, e) => {
     opened.push({ columns: e.columns })
@@ -516,6 +524,103 @@ describe('/pair', () => {
 
     expect(prompts.at(-1)?.context).toHaveLength(1)
     expect(prompts.at(-1)?.context?.[0]).toStartWith('The `pair` mod is on')
+  })
+})
+
+describe('taking over', () => {
+  test('drive opens the editor, and review sends Claude what was typed with the note', async ($, on) => {
+    const { clock, files, commands, prompts } = world(on, SOURCE)
+
+    const started = await command($, 'pair', 'drive a.ts')
+    expect(started.text).toMatch(/You are driving: changes to \/work\/a\.ts/)
+    expect(started.context?.[0]).toMatch(/taken over the keyboard/)
+    expect(commands.at(-1)).toEqual([VS_CODE_APP, FILE])
+
+    files[FILE] = 'import x from "x"\nconst count = 1\nconst b = 2\n'
+    const sent = await command($, 'pair', 'review I renamed a. Is count clear enough?')
+    expect(prompts).toHaveLength(0)
+    await clock.advance(100)
+
+    expect(sent.text).toBe('Sent 1 file, +1 -1 lines to Claude for review.')
+    expect(prompts.at(-1)?.text).toBe(
+      'Review the changes I just typed myself (1 file, +1 -1 lines). I renamed a. Is count clear enough?',
+    )
+    const [changes] = sent.context ?? []
+    expect(changes).toStartWith('pair: the user took over and typed the changes below themselves')
+    expect(changes).toContain(`--- ${FILE}\n+++ ${FILE}\n@@ -1,3 +1,3 @@`)
+    expect(changes).toContain('+const count = 1')
+
+    expect((await command($, 'pair', 'review')).text).toMatch(/nothing to review yet/)
+  })
+
+  test('review with nothing changed keeps you driving', async ($, on) => {
+    const { files } = world(on, SOURCE)
+    await command($, 'pair', 'drive a.ts')
+
+    expect((await command($, 'pair', 'review')).text).toMatch(/nothing has changed/)
+    files[FILE] = 'changed\n'
+    expect((await command($, 'pair', 'review')).text).toMatch(/^Sent 1 file/)
+  })
+
+  test('outside a repository it watches the files Claude edited, and asks for names when there are none', async ($, on) => {
+    const { files } = world(on, { '/elsewhere/z.ts': 'let z = 1\n' })
+
+    expect((await command($, 'pair', 'drive')).text).toMatch(/name the files/)
+    await command($, 'pair', 'off')
+    await $.tool.call({ tool: 'Edit', file_path: '/elsewhere/z.ts', old_string: 'let', new_string: 'const' })
+    expect((await command($, 'pair', 'drive')).text).toMatch(/changes to \/elsewhere\/z\.ts/)
+
+    files['/elsewhere/z.ts'] = 'const z = 1\n'
+    const sent = await command($, 'pair', 'review')
+    expect(sent.text).toMatch(/^Sent 1 file/)
+    expect(sent.context?.[0]).toContain('+++ /elsewhere/z.ts')
+  })
+
+  test('a file can be named by its name alone, with ~, or through the @ file picker', async ($, on) => {
+    const nested = { ...SOURCE, '/work/src/deep/b.ts': 'let b = 1\n', '/work/x/c.ts': '1\n', '/work/y/c.ts': '2\n' }
+    world(on, nested, true, argv =>
+      argv[0] === 'find' && argv.includes('-path')
+        ? { stdout: Object.keys(nested).filter(path => path.endsWith(String(argv[argv.indexOf('-path') + 1]).slice(1))).join('\n') }
+        : undefined,
+    )
+    const driving = async (args: string) => (await command($, 'pair', `drive ${args}`)).text
+
+    expect(await driving('b.ts')).toMatch(/changes to \/work\/src\/deep\/b\.ts/)
+    expect(await driving('deep/b.ts')).toMatch(/changes to \/work\/src\/deep\/b\.ts/)
+    expect(await driving('@a.ts')).toMatch(/changes to \/work\/a\.ts/)
+    expect(await driving('~/notes.md')).toMatch(/changes to \/home\/dev\/notes\.md/)
+    expect(await driving('c.ts')).toMatch(/several files match c\.ts: \/work\/x\/c\.ts, \/work\/y\/c\.ts/)
+  })
+
+  test('in a git repository the whole work tree is compared, through a throwaway index', async ($, on) => {
+    let trees = 0
+    const { clock, commands, prompts } = world(on, {}, true, argv => {
+      const line = argv.join(' ')
+      if (line === 'git rev-parse --show-toplevel') {
+        return { stdout: '/repo\n' }
+      }
+      if (line.endsWith(' git write-tree')) {
+        trees += 1
+
+        return { stdout: `tree${trees}\n` }
+      }
+      if (line.startsWith('git diff ')) {
+        return { stdout: 'diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-old\n+new\n' }
+      }
+
+      return undefined
+    })
+
+    expect((await command($, 'pair', 'drive /elsewhere/b.ts')).text).toMatch(/changes to \/elsewhere\/b\.ts/)
+    expect((await command($, 'pair', 'drive')).text).toMatch(/every change under \/repo/)
+    expect(commands).toContainEqual(['env', 'GIT_INDEX_FILE=/tmp/t/pair-review-sess/drive-index', 'git', 'add', '-A'])
+    expect(commands.at(-1)).toEqual([VS_CODE_APP, '/repo'])
+
+    const sent = await command($, 'pair', 'review')
+    await clock.advance(100)
+    expect(commands).toContainEqual(['git', 'diff', '--no-color', '--no-ext-diff', 'tree1', 'tree2'])
+    expect(prompts.at(-1)?.text).toBe('Review the changes I just typed myself (1 file, +1 -1 lines).')
+    expect(sent.context?.[0]).toContain('+new')
   })
 })
 

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { PairEntry, PairNotebook, PairPendingEdit } from '../types'
+import type { PairDrive, PairEntry, PairNotebook, PairPendingEdit } from '../types'
 import { applyEdit, unifiedDiff } from './diff'
 import type { FileDiff } from './diff'
 
@@ -23,6 +23,7 @@ type GateActions = {
   viewFile: (id: string) => Promise<void>
   toggleContext: (id: string) => Promise<void>
 }
+type Changes = { text: string; files: number; added: number; removed: number }
 type NotebookRequest = {
   action: 'decided' | 'open' | 'resolve' | 'edit' | 'remove' | 'clear' | 'list'
   id?: number
@@ -38,6 +39,11 @@ const WIDE_CONTEXT = 20
 const WIDE_COLUMNS = 120
 // Tried in order: the launcher on PATH, then the one inside the macOS app.
 const VS_CODE = ['code', '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code']
+const REVIEW_BUDGET = 60_000
+const TOUCHED_MAX = 50
+const SUBMIT_DELAY_MS = 100
+// Hidden folders, dependencies and caches are never what the user is typing in.
+const SKIPPED = ['(', '-name', '.*', '-o', '-name', 'node_modules', '-o', '-name', '__pycache__', ')', '-prune']
 const SKILL = 'skills/collaborate/SKILL.md'
 const modNote = () => [
   'The `pair` mod is on in this session.',
@@ -54,14 +60,22 @@ const APPROVED_NOTE = 'pair: the user approved this edit in the review.'
 const OFF_NOTE =
   'pair: the user turned pair mode off. Work as you normally would, without the collaborate instructions or the pair rules, until they turn it on again.'
 const ON_NOTE = 'pair: the user turned pair mode on. The collaborate instructions and the pair rules apply.'
+const DRIVE_NOTE =
+  'pair: the user has taken over the keyboard to type changes themselves. Leave the files alone until they run /pair review, which sends you what they typed.'
+const REVIEW_RULES =
+  'pair: the user took over and typed the changes below themselves, between /pair drive and /pair review. Review them as their pairing partner: say what the change does, point out bugs, risks and anything unclear, and answer the note in their message if there is one. Do not rewrite or revert their work; propose a fix and wait for them to agree. Claude Code may also tell you these files changed on disk: those are the same edits. If an IDE is connected, check its diagnostics for these files.'
 // How many changed lines one edit should stay under: the `maxReviewLines` setting.
 let maxLines = 40
+// The command /pair drive opens files with: the `editor` setting.
+let editor = 'code'
 
 const isOn = atom({ plugin: 'pair', key: 'isOn' } as const, true)
 const notebook = atom({ plugin: 'pair', key: 'notebook' } as const, { nextId: 1, entries: [] })
 const pending = atom({ plugin: 'pair', key: 'pending' } as const, [])
 const isGateInBand = atom({ plugin: 'pair', key: 'isGateInBand' } as const, false)
 const hasSentInstructions = atom({ plugin: 'pair', key: 'hasSentInstructions' } as const, false)
+const drive = atom({ plugin: 'pair', key: 'drive' } as const, null)
+const touched = atom({ plugin: 'pair', key: 'touched' } as const, [])
 const explanations = atom({ plugin: 'pair', key: 'explanations' } as const, {})
 const tick = { plugin: 'pair', key: 'tick' } as const
 
@@ -389,11 +403,204 @@ const actionsFor = ($: EngineInterface): GateActions => ({
   toggleContext: id => toggleContext($, id),
 })
 
+const run = async ($: EngineInterface, argv: string[], cwd?: string): Promise<string | undefined> => {
+  try {
+    const ran = await $.process.run(argv, cwd === undefined ? undefined : { cwd })
+
+    return ran.exitCode === 0 ? ran.stdout : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// The work tree under `root` as a git tree, untracked files included, built in
+// a throwaway index so the repository's own index and files stay untouched.
+const gitTree = async ($: EngineInterface, root: string): Promise<string | undefined> => {
+  const dir = await copiesDir($)
+  const index = `${dir}/drive-index`
+  const inIndex = (...git: string[]) => run($, ['env', `GIT_INDEX_FILE=${index}`, 'git', ...git], root)
+  await run($, ['mkdir', '-m', '700', '-p', dir])
+  const own = (await run($, ['git', 'rev-parse', '--path-format=absolute', '--git-path', 'index'], root))?.trim()
+  if (own !== undefined && own !== '') {
+    // Starting from the repository's index, only changed files are hashed again.
+    await run($, ['cp', own, index])
+  }
+  const tree = (await inIndex('add', '-A')) === undefined ? undefined : (await inIndex('write-tree'))?.trim()
+  await run($, ['rm', '-f', index])
+
+  return tree === '' ? undefined : tree
+}
+
+const openEditor = async ($: EngineInterface, paths: string[]): Promise<boolean> => {
+  for (const command of editor === 'code' ? VS_CODE : [editor]) {
+    if ((await run($, [command, ...paths])) !== undefined) {
+      return true
+    }
+  }
+
+  return false
+}
+
+const found = async ($: EngineInterface, folder: string, depth: number, ...tests: string[]) =>
+  (
+    await run($, [
+      'find', folder, '-mindepth', '1', '-maxdepth', String(depth),
+      ...SKIPPED, '-o', '-type', 'f', ...tests, '-print',
+    ])
+  )
+    ?.split('\n')
+    .filter(path => path !== '')
+
+// A file as the user named it: `@` from the file picker and `~` are accepted,
+// and a name that is not at that place is looked for under the session's folder.
+const resolvePath = async (
+  $: EngineInterface,
+  word: string,
+  cwd: string,
+): Promise<string | { problem: string }> => {
+  const typed = word.replace(/^@/, '')
+  if (typed === '~' || typed.startsWith('~/')) {
+    return `${(await $.env.get('HOME')) ?? ''}${typed.slice(1)}`
+  }
+  const direct = typed.startsWith('/') ? typed : `${cwd}/${typed}`
+  if (typed.startsWith('/') || (await $.fs.exists(direct))) {
+    return direct
+  }
+  // Near the top first: a deep search of a very large folder takes seconds.
+  const near = (await found($, cwd, 4, '-path', `*/${typed}`)) ?? []
+  const matches = near.length > 0 ? near : ((await found($, cwd, 8, '-path', `*/${typed}`)) ?? [])
+  if (matches.length > 1) {
+    return {
+      problem: `pair: several files match ${typed}: ${matches.slice(0, 8).join(', ')}. Name one with more of its path.`,
+    }
+  }
+
+  return matches[0] ?? direct
+}
+
+const startDrive = async ($: EngineInterface, args: string) => {
+  const cwd = await $.session.cwd()
+  const named: string[] = []
+  for (const word of args.split(/\s+/).filter(typed => typed !== '')) {
+    const path = await resolvePath($, word, cwd)
+    if (typeof path !== 'string') {
+      return { text: path.problem }
+    }
+    named.push(path)
+  }
+  // The repository is the one the named files are in; git covers the drive
+  // only when it holds all of them.
+  const first = named[0]
+  const base = first === undefined ? cwd : first.slice(0, first.lastIndexOf('/')) || '/'
+  const top = (await run($, ['git', 'rev-parse', '--show-toplevel'], base))?.trim() || undefined
+  const root = named.every(path => path.startsWith(`${top}/`)) ? top : undefined
+  const tree = root === undefined ? undefined : await gitTree($, root)
+  let started: PairDrive
+  if (root !== undefined && tree !== undefined) {
+    started = { kind: 'git', root, tree }
+  } else {
+    const paths = [...new Set([...named, ...(await read($, touched))])]
+    if (paths.length === 0) {
+      return {
+        text: 'pair: this folder is not a git repository, so name the files you are taking over: /pair drive <file> ...',
+      }
+    }
+    const files: Record<string, string | null> = {}
+    for (const path of paths) {
+      files[path] = await readOrNull($, path)
+    }
+    started = { kind: 'files', files }
+  }
+  await update($, drive, () => started)
+  $.ui.status('pair: you are driving; /pair review hands back')
+  const scope =
+    started.kind === 'git'
+      ? `every change under ${started.root}`
+      : `changes to ${Object.keys(started.files).join(', ')}`
+  const isOpen = await openEditor($, named.length > 0 ? named : [root ?? cwd])
+
+  return {
+    text: `You are driving: ${scope} will be in the review. ${isOpen ? '' : `Could not start ${editor}, so open the files yourself. `}Run /pair review [note] to hand back.`,
+    context: [DRIVE_NOTE],
+  }
+}
+
+const driveChanges = async ($: EngineInterface, started: PairDrive): Promise<Changes | undefined> => {
+  if (started.kind === 'git') {
+    const tree = await gitTree($, started.root)
+    const text =
+      tree === undefined
+        ? undefined
+        : await run($, ['git', 'diff', '--no-color', '--no-ext-diff', started.tree, tree], started.root)
+    if (text === undefined) {
+      return undefined
+    }
+    const rows = text.split('\n')
+
+    return {
+      text,
+      files: rows.filter(row => row.startsWith('diff --git ')).length,
+      added: rows.filter(row => row.startsWith('+') && !row.startsWith('+++')).length,
+      removed: rows.filter(row => row.startsWith('-') && !row.startsWith('---')).length,
+    }
+  }
+
+  const changes: Changes = { text: '', files: 0, added: 0, removed: 0 }
+  for (const [path, before] of Object.entries(started.files)) {
+    const after = await readOrNull($, path)
+    if (after === before) {
+      continue
+    }
+    const diff = unifiedDiff(before ?? '', after ?? '', REVIEW_BUDGET)
+    changes.text += `--- ${before === null ? '/dev/null' : path}\n+++ ${after === null ? '/dev/null' : path}\n${diff.text}\n`
+    changes.files += 1
+    changes.added += diff.added
+    changes.removed += diff.removed
+  }
+
+  return changes
+}
+
+const requestReview = async ($: EngineInterface, note: string) => {
+  const started = await read($, drive)
+  if (started === null) {
+    return { text: 'pair: nothing to review yet. Run /pair drive, type your changes, then /pair review.' }
+  }
+  const changes = await driveChanges($, started)
+  if (changes === undefined) {
+    return { text: 'pair: git could not show what changed, so nothing was sent. You are still driving.' }
+  }
+  if (changes.files === 0) {
+    return { text: 'pair: nothing has changed since /pair drive. Save your files, then run /pair review again.' }
+  }
+  await update($, drive, () => null)
+  $.ui.status(undefined)
+  const size = `${changes.files} file${changes.files === 1 ? '' : 's'}, +${changes.added} -${changes.removed} lines`
+  const typed = [
+    REVIEW_RULES,
+    changes.text.length > REVIEW_BUDGET ? `The diff is cut at ${REVIEW_BUDGET} characters; read the files for the rest.` : '',
+    changes.text.slice(0, REVIEW_BUDGET),
+  ]
+    .filter(part => part !== '')
+    .join('\n\n')
+  const text = `Review the changes I just typed myself (${size}).${note === '' ? '' : ` ${note}`}`
+  // A command may not submit a prompt itself, so a timer does once it is done.
+  // The changes travel as this command's hidden note, which that prompt's turn reads.
+  $.clock.after(SUBMIT_DELAY_MS, () => {
+    void $.prompt.submit({ text, asUser: true }).catch(() => {
+      $.ui.toast('pair: could not start the review. Send any prompt and Claude will see your changes.')
+    })
+  })
+
+  return { text: `Sent ${size} to Claude for review.`, context: [typed] }
+}
+
 const review = async (
   $: EngineInterface,
   signal: AbortSignal,
   call: HeldCall,
 ): Promise<Verdict> => {
+  await update($, touched, list => (list.includes(call.path) ? list : [...list, call.path].slice(-TOUCHED_MAX)))
   if (!(await read($, isOn)) || (await $.session.surfaces()).length === 0) {
     return {}
   }
@@ -469,12 +676,15 @@ export const register: Register = (on, options) => {
   if (typeof options.maxReviewLines === 'number' && options.maxReviewLines >= 1) {
     maxLines = Math.floor(options.maxReviewLines)
   }
+  if (typeof options.editor === 'string' && options.editor.trim() !== '') {
+    editor = options.editor.trim()
+  }
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'pair',
-      description: 'Turn pairing mode on or off: the edit review and the collaborate instructions',
-      argumentHint: '[on|off|status]',
+      description: 'Turn pairing mode on or off, or take over the typing and have Claude review it',
+      argumentHint: '[on|off|status | drive [files] | review [note]]',
       immediate: true,
     })
     await $.command.register({
@@ -612,6 +822,13 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'pair' }, async ($, e) => {
+    const [verb = '', ...rest] = e.args.trim().split(/\s+/)
+    if (verb.toLowerCase() === 'drive') {
+      return startDrive($, rest.join(' '))
+    }
+    if (verb.toLowerCase() === 'review') {
+      return requestReview($, e.args.trim().slice(verb.length).trim())
+    }
     const word = e.args.trim().toLowerCase()
     const skill = await loadSkill($)
     const skillLine =
@@ -626,7 +843,7 @@ export const register: Register = (on, options) => {
       }
     }
     if (word !== '' && word !== 'on' && word !== 'off') {
-      return { text: 'Usage: /pair [on|off|status]' }
+      return { text: 'Usage: /pair [on|off|status] | drive [files] | review [note]' }
     }
 
     const isNowOn = await update($, isOn, was => (word === '' ? !was : word === 'on'))
