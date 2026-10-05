@@ -583,14 +583,14 @@ describe('taking over', () => {
     expect(changes).toContain(`--- ${FILE}\n+++ ${FILE}\n@@ -1,3 +1,3 @@`)
     expect(changes).toContain('+const count = 1')
 
-    expect((await command($, 'pair', 'review')).text).toMatch(/nothing to review yet/)
+    expect((await command($, 'pair', 'review')).text).toStartWith('Nothing to review yet.')
   })
 
   test('review with nothing changed keeps you driving', async ($, on) => {
     const { files } = world(on, SOURCE)
     await command($, 'pair', 'drive a.ts')
 
-    expect((await command($, 'pair', 'review')).text).toMatch(/nothing has changed/)
+    expect((await command($, 'pair', 'review')).text).toStartWith('Nothing has changed since /pair drive.')
     files[FILE] = 'changed\n'
     expect((await command($, 'pair', 'review')).text).toMatch(/^Sent 1 file/)
   })
@@ -598,7 +598,7 @@ describe('taking over', () => {
   test('outside a repository it watches the files Claude edited, and asks for names when there are none', async ($, on) => {
     const { files } = world(on, { '/elsewhere/z.ts': 'let z = 1\n' })
 
-    expect((await command($, 'pair', 'drive')).text).toMatch(/name the files/)
+    expect((await command($, 'pair', 'drive')).text).toStartWith('This folder is not a git repository, so name the files')
     await command($, 'pair', 'off')
     await $.tool.call({ tool: 'Edit', file_path: '/elsewhere/z.ts', old_string: 'let', new_string: 'const' })
     expect((await command($, 'pair', 'drive')).text).toMatch(/changes to \/elsewhere\/z\.ts/)
@@ -622,7 +622,7 @@ describe('taking over', () => {
     expect(await driving('deep/b.ts')).toMatch(/changes to \/work\/src\/deep\/b\.ts/)
     expect(await driving('@a.ts')).toMatch(/changes to \/work\/a\.ts/)
     expect(await driving('~/notes.md')).toMatch(/changes to \/home\/dev\/notes\.md/)
-    expect(await driving('c.ts')).toMatch(/several files match c\.ts: \/work\/x\/c\.ts, \/work\/y\/c\.ts/)
+    expect(await driving('c.ts')).toStartWith('Several files match c.ts: /work/x/c.ts, /work/y/c.ts.')
   })
 
   test('in a git repository the whole work tree is compared, through a throwaway index', async ($, on) => {
@@ -670,7 +670,7 @@ describe('notebook', () => {
     await command($, 'notebook', 'edit 1 Use Postgres')
     const listed = await command($, 'notebook', 'remove #2')
     expect(listed.text).toBe('Decided\n  #1 Use Postgres\nOpen questions\n  #3 Which port?')
-    expect((await command($, 'notebook', 'resolve 9')).text).toMatch(/no notebook entry #9/)
+    expect((await command($, 'notebook', 'resolve 9')).text).toStartWith('No notebook entry #9.')
   })
 
   test('the band is one line when narrow and lists entries when wide', async ($, on) => {

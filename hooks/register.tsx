@@ -180,7 +180,7 @@ const changeNotebook = async ($: EngineInterface, request: NotebookRequest): Pro
   }
   if (action === 'decided' || action === 'open') {
     if (text === '') {
-      return 'pair: an entry needs text.'
+      return 'An entry needs text.'
     }
 
     return formatBook(
@@ -193,10 +193,10 @@ const changeNotebook = async ($: EngineInterface, request: NotebookRequest): Pro
 
   const target = (await read($, notebook)).entries.find(entry => entry.id === id)
   if (target === undefined) {
-    return `pair: no notebook entry #${id ?? '?'}.\n${formatBook(await read($, notebook))}`
+    return `No notebook entry #${id ?? '?'}.\n${formatBook(await read($, notebook))}`
   }
   if (action === 'edit' && text === '') {
-    return 'pair: an edit needs the new text.'
+    return 'An edit needs the new text.'
   }
   const changed: PairEntry | undefined =
     action === 'remove'
@@ -349,7 +349,7 @@ const viewFile = async ($: EngineInterface, id: string) => {
   const whole = wholes.get(id)
   const entry = (await read($, pending)).find(one => one.id === id)
   if (whole === undefined || entry === undefined) {
-    $.ui.toast('pair: no whole-file view for this edit')
+    $.ui.toast('No whole-file view for this edit')
 
     return
   }
@@ -369,16 +369,16 @@ const viewFile = async ($: EngineInterface, id: string) => {
         return
       }
     }
-    $.ui.toast('pair: could not start VS Code')
+    $.ui.toast('Could not start VS Code')
   } catch {
-    $.ui.toast('pair: could not prepare the whole-file view')
+    $.ui.toast('Could not prepare the whole-file view')
   }
 }
 
 const toggleContext = async ($: EngineInterface, id: string) => {
   const whole = wholes.get(id)
   if (whole === undefined) {
-    $.ui.toast('pair: no more context for this edit')
+    $.ui.toast('No wide view for this edit')
 
     return
   }
@@ -471,7 +471,7 @@ const resolvePath = async (
   const matches = near.length > 0 ? near : ((await found($, cwd, 8, '-path', `*/${typed}`)) ?? [])
   if (matches.length > 1) {
     return {
-      problem: `pair: several files match ${typed}: ${matches.slice(0, 8).join(', ')}. Name one with more of its path.`,
+      problem: `Several files match ${typed}: ${matches.slice(0, 8).join(', ')}. Name one with more of its path.`,
     }
   }
 
@@ -502,7 +502,7 @@ const startDrive = async ($: EngineInterface, args: string) => {
     const paths = [...new Set([...named, ...(await read($, touched))])]
     if (paths.length === 0) {
       return {
-        text: 'pair: this folder is not a git repository, so name the files you are taking over: /pair drive <file> ...',
+        text: 'This folder is not a git repository, so name the files you are taking over: /pair drive <file> ...',
       }
     }
     const files: Record<string, string | null> = {}
@@ -564,14 +564,14 @@ const driveChanges = async ($: EngineInterface, started: PairDrive): Promise<Cha
 const requestReview = async ($: EngineInterface, note: string) => {
   const started = await read($, drive)
   if (started === null) {
-    return { text: 'pair: nothing to review yet. Run /pair drive, type your changes, then /pair review.' }
+    return { text: 'Nothing to review yet. Run /pair drive, type your changes, then /pair review.' }
   }
   const changes = await driveChanges($, started)
   if (changes === undefined) {
-    return { text: 'pair: git could not show what changed, so nothing was sent. You are still driving.' }
+    return { text: 'Git could not show what changed, so nothing was sent. You are still driving.' }
   }
   if (changes.files === 0) {
-    return { text: 'pair: nothing has changed since /pair drive. Save your files, then run /pair review again.' }
+    return { text: 'Nothing has changed since /pair drive. Save your files, then run /pair review again.' }
   }
   await update($, drive, () => null)
   $.ui.status(undefined)
@@ -588,7 +588,7 @@ const requestReview = async ($: EngineInterface, note: string) => {
   // The changes travel as this command's hidden note, which that prompt's turn reads.
   $.clock.after(SUBMIT_DELAY_MS, () => {
     void $.prompt.submit({ text, asUser: true }).catch(() => {
-      $.ui.toast('pair: could not start the review. Send any prompt and Claude will see your changes.')
+      $.ui.toast('Could not start the review. Send any prompt and Claude will see your changes.')
     })
   })
 
