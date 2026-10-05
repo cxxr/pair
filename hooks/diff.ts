@@ -169,6 +169,81 @@ export const unifiedDiff = (
   }
 }
 
+export type Chunk = { path: string; diff: string; added: number; removed: number }
+
+const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/
+
+/**
+ * A `git diff` as chunks to review one at a time: each a hunk of one file, cut
+ * once it holds `limit` changed lines. Lines that replace removed ones stay
+ * with them, up to twice the limit. A file git shows no text for is one chunk
+ * with no diff.
+ */
+export const chunksOf = (patch: string, limit: number): Chunk[] => {
+  const chunks: Chunk[] = []
+  let path = ''
+  let rows: string[] = []
+  let isInHunk = false
+  let isReplacing = false
+  let oldAt = 0
+  let newAt = 0
+  let olds = 0
+  let news = 0
+  let added = 0
+  let removed = 0
+  const flush = () => {
+    if (added + removed > 0) {
+      const header = `@@ -${olds === 0 ? oldAt : oldAt + 1},${olds} +${news === 0 ? newAt : newAt + 1},${news} @@`
+      chunks.push({ path, diff: [header, ...rows].join('\n'), added, removed })
+    }
+    oldAt += olds
+    newAt += news
+    rows = []
+    olds = 0
+    news = 0
+    added = 0
+    removed = 0
+  }
+
+  for (const line of patch.split('\n')) {
+    const hunk = HUNK.exec(line)
+    if (line.startsWith('diff --git ')) {
+      flush()
+      isInHunk = false
+      path = line.slice(line.lastIndexOf(' b/') + 3)
+    } else if (hunk !== null) {
+      flush()
+      isInHunk = true
+      const [, oldStart = '0', oldCount = '1', newStart = '0', newCount = '1'] = hunk
+      oldAt = Number(oldCount) === 0 ? Number(oldStart) : Number(oldStart) - 1
+      newAt = Number(newCount) === 0 ? Number(newStart) : Number(newStart) - 1
+    } else if (!isInHunk) {
+      if (line.startsWith('+++ b/')) {
+        path = line.slice(6)
+      } else if (line.startsWith('Binary files ')) {
+        chunks.push({ path, diff: '', added: 0, removed: 0 })
+      }
+    } else if (line.startsWith('\\')) {
+      rows.push(line)
+    } else if (line !== '') {
+      const kind = line.charAt(0)
+      const changed = added + removed
+      if (changed >= limit * 2 || (changed >= limit && !(isReplacing && kind === '+'))) {
+        flush()
+      }
+      isReplacing = kind === '-' || (isReplacing && kind === '+')
+      rows.push(`${kind}${printable(line.slice(1))}`)
+      olds += kind === '+' ? 0 : 1
+      news += kind === '-' ? 0 : 1
+      added += kind === '+' ? 1 : 0
+      removed += kind === '-' ? 1 : 0
+    }
+  }
+  flush()
+
+  return chunks
+}
+
 /**
  * `content` as the Edit tool would leave it, or undefined when `oldText` is
  * not in it.

@@ -12,6 +12,23 @@ export type PairPendingEdit = {
   isWide: boolean
 }
 
+export type PairChunk = { path: string; diff: string; added: number; removed: number }
+
+// What one Bash command changed, cut into chunks the user steps through.
+export type PairCommandReview = {
+  id: string
+  command: string
+  root: string
+  before: string
+  files: number
+  added: number
+  removed: number
+  chunks: PairChunk[]
+  hidden: number
+  at: number
+  flagged: number[]
+}
+
 // Where the files stood when the user took over: a git tree of the whole work
 // tree, or outside a repository the text of each file being watched.
 export type PairDrive =
@@ -24,6 +41,7 @@ declare module 'claude-code' {
       isOn: boolean
       notebook: PairNotebook
       pending: PairPendingEdit[]
+      commands: PairCommandReview[]
       isGateInBand: boolean
       hasSentInstructions: boolean
       drive: PairDrive | null

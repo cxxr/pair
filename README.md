@@ -5,6 +5,7 @@ A Claude Code mod that turns Claude into a pair-programming partner: neither of 
 - **Edit review.** Every `Edit` and `Write` is held until you decide on it, beside its diff.
 - **Shared notebook.** A running list of what you have decided and what is still open, which both of you can update.
 - **Collaboration instructions.** The bundled `collaborate` skill is sent to Claude once per session, with your first prompt, so Claude explains before it asks, proposes before it builds, and works in small steps.
+- **Command review.** When a Bash command changes files, you step through what it changed before Claude goes on.
 - **Taking over.** `/pair drive` hands you the keyboard, and `/pair review` has Claude review what you typed.
 - **One switch.** `/pair` turns all of it on or off.
 
@@ -76,6 +77,24 @@ Claude adds and resolves entries through its own `notebook` tool.
 
 With pair mode off, edits run without review, Claude is told to work as it normally would, and the notebook band is hidden. An edit that is being held when you turn it off goes ahead. The setting lasts for the session; a new session starts with pair mode on.
 
+### When a command changes files
+
+A shell command's changes are on disk before anyone can look at them, so they can't be held the way an edit is. Instead, when a Bash command has changed files in a git repository, its result waits while you step through what it changed. The review shows the command, a summary such as `Bash changed 3 files, +42 -7 lines`, and one change at a time, each cut to your review size target.
+
+| Key | Button | What it does |
+| --- | --- | --- |
+| `1` | Next | This change is fine; show the next one. |
+| `2` | Discuss | Mark this change and move on. When you finish, Claude explains the marked ones and waits. |
+| `3` | Accept the rest | Stop stepping and let Claude go on. |
+| `5` | Whole file | Compare the file as it was before the command with the file now, in VS Code. |
+| `Esc` | | Stop here; Claude waits for you in the chat. |
+
+Things to know:
+
+- It works in git repositories only: the repository of the session's folder, or of the folder a command starts by changing into with `cd`.
+- The mod takes a snapshot of the repository before and after every Bash command to see what changed. That adds a fraction of a second per command; turn it off with `reviewBash` in `/config`.
+- A command left running in the background is not reviewed, and a file you save yourself while a command runs is shown as that command's change.
+
 ### Taking over
 
 Sometimes you want to type a change yourself and have Claude review it.
@@ -120,7 +139,7 @@ The instructions go to Claude once per session, with the first prompt you send w
 
 ## What it does not do
 
-- **Only `Edit` and `Write` are held.** `Bash`, `NotebookEdit` and other tools can still change files without review.
+- **Only `Edit` and `Write` are held before they happen.** What a `Bash` command changed is reviewed afterwards, in git repositories. `NotebookEdit` and other tools can still change files without review.
 - **Headless runs are not held.** With nobody to ask (`claude -p`), edits go straight through.
 - **It does not replace Claude Code's permissions.** After you approve an edit, Claude Code's own permission rules still apply to it.
 

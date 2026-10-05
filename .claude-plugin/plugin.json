@@ -1,6 +1,6 @@
 {
   "name": "pair",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Pair programming: edits wait for your review, a shared notebook tracks decisions, and /pair switches the mode on or off.",
   "author": { "name": "Sean Cassidy" },
   "license": "MIT",
@@ -14,6 +14,12 @@
       "title": "Review size target",
       "description": "How many changed lines one edit should stay under. Claude is told to keep to it, and a review over it says so and can be sent back with Split.",
       "default": 40
+    },
+    "reviewBash": {
+      "type": "boolean",
+      "title": "Review what commands change",
+      "description": "After a Bash command changes files in a git repository, walk through its changes in the review pane before Claude goes on. Takes two quick snapshots of the repository around every command.",
+      "default": true
     },
     "editor": {
       "type": "string",

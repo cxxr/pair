@@ -1,8 +1,8 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { PairDrive, PairEntry, PairNotebook, PairPendingEdit } from '../types'
-import { applyEdit, unifiedDiff } from './diff'
+import type { PairCommandReview, PairDrive, PairEntry, PairNotebook, PairPendingEdit } from '../types'
+import { applyEdit, chunksOf, unifiedDiff } from './diff'
 import type { FileDiff } from './diff'
 
 type Decision = 'approve' | 'discuss' | 'skip' | 'split' | 'talk' | 'release'
@@ -22,6 +22,8 @@ type GateActions = {
   choose: (id: string, decision: Decision) => void
   viewFile: (id: string) => Promise<void>
   toggleContext: (id: string) => Promise<void>
+  step: (id: string, isFlagged: boolean) => Promise<void>
+  viewChunk: (id: string) => Promise<void>
 }
 type Changes = { text: string; files: number; added: number; removed: number }
 type NotebookRequest = {
@@ -42,6 +44,7 @@ const VS_CODE = ['code', '/Applications/Visual Studio Code.app/Contents/Resource
 const REVIEW_BUDGET = 60_000
 const TOUCHED_MAX = 50
 const SUBMIT_DELAY_MS = 100
+const CHUNKS_MAX = 200
 // Hidden folders, dependencies and caches are never what the user is typing in.
 const SKIPPED = ['(', '-name', '.*', '-o', '-name', 'node_modules', '-o', '-name', '__pycache__', ')', '-prune']
 const SKILL = 'skills/collaborate/SKILL.md'
@@ -68,10 +71,13 @@ const REVIEW_RULES =
 let maxLines = 40
 // The command /pair drive opens files with: the `editor` setting.
 let editor = 'code'
+// Whether what a Bash command changed is reviewed: the `reviewBash` setting.
+let isBashReviewed = true
 
 const isOn = atom({ plugin: 'pair', key: 'isOn' } as const, true)
 const notebook = atom({ plugin: 'pair', key: 'notebook' } as const, { nextId: 1, entries: [] })
 const pending = atom({ plugin: 'pair', key: 'pending' } as const, [])
+const commands = atom({ plugin: 'pair', key: 'commands' } as const, [])
 const isGateInBand = atom({ plugin: 'pair', key: 'isGateInBand' } as const, false)
 const hasSentInstructions = atom({ plugin: 'pair', key: 'hasSentInstructions' } as const, false)
 const drive = atom({ plugin: 'pair', key: 'drive' } as const, null)
@@ -273,6 +279,51 @@ const gateTree = (
   </Box>
 )
 
+const commandTree = (
+  { Box, Text, Button, Code }: Kit,
+  head: PairCommandReview,
+  waiting: number,
+  hint: string,
+  actions: GateActions,
+) => {
+  const chunk = head.chunks[head.at]
+  const notes = [
+    head.flagged.length > 0 ? `${head.flagged.length} marked to discuss.` : '',
+    head.hidden > 0 ? `${head.hidden} more changes are not shown here.` : '',
+    waiting > 0 ? `${waiting} more waiting.` : '',
+  ].filter(part => part !== '')
+
+  return (
+    <Box flexDirection="column">
+      <Text bold>{`Bash changed ${head.files} file${head.files === 1 ? '' : 's'}, +${head.added} -${head.removed} lines`}</Text>
+      <Text dimColor wrap="truncate-end">{`$ ${head.command}`}</Text>
+      {chunk !== undefined && (
+        <Box gap={1}>
+          <Text>{`Change ${head.at + 1} of ${head.chunks.length}:`}</Text>
+          <Button key="file" plain label={chunk.path} onPress={() => actions.viewChunk(head.id)} />
+          <Text dimColor>{`+${chunk.added} -${chunk.removed}`}</Text>
+        </Box>
+      )}
+      {chunk === undefined ? (
+        <Text dimColor>No more changes.</Text>
+      ) : chunk.diff === '' ? (
+        <Text dimColor>This file is not text, so there is no diff to show.</Text>
+      ) : (
+        <Code source={chunk.diff} format="diff" path={chunk.path} />
+      )}
+      <Box gap={3}>
+        <Button key="next" hotkey="1" plain label="Next" onPress={() => actions.step(head.id, false)} />
+        <Button key="flag" hotkey="2" plain label="Discuss" onPress={() => actions.step(head.id, true)} />
+        <Button key="rest" hotkey="3" plain label="Accept the rest" onPress={() => actions.choose(head.id, 'approve')} />
+      </Box>
+      <Box gap={3}>
+        <Button key="whole" hotkey="5" plain label="Whole file" onPress={() => actions.viewChunk(head.id)} />
+      </Box>
+      <Text dimColor>{[hint, ...notes].join(' ')}</Text>
+    </Box>
+  )
+}
+
 const bandTree = ({ Box, Text }: Kit, book: PairNotebook, columns: number) => {
   const decided = ofKind(book, 'decided')
   const open = ofKind(book, 'open')
@@ -299,6 +350,8 @@ const bandTree = ({ Box, Text }: Kit, book: PairNotebook, columns: number) => {
 const decisions = new Map<string, Decision>()
 const held = new Set<string>()
 const wholes = new Map<string, Whole>()
+// The chunks of a command's changes the user marked to discuss, by command.
+const flags = new Map<string, number[]>()
 let waker = new AbortController()
 
 const wake = () => {
@@ -316,7 +369,7 @@ const choose = (id: string, decision: Decision) => {
 const showGate = async ($: EngineInterface, columns?: number) => {
   const opened = await $.ui.open({
     id: GATE,
-    title: 'Pair: review edit',
+    title: 'Pair: review',
     focus: true,
     closeOnEscape: true,
     ...(columns === undefined ? {} : { columns }),
@@ -362,14 +415,9 @@ const viewFile = async ($: EngineInterface, id: string) => {
     if (whole.before === null) {
       await $.fs.write(copy('before'), '')
     }
-    const current = whole.before === null ? copy('before') : entry.path
-    for (const code of VS_CODE) {
-      const ran = await $.process.run([code, '--diff', current, copy('proposed')]).catch(() => undefined)
-      if (ran?.exitCode === 0) {
-        return
-      }
+    if (!(await compare($, whole.before === null ? copy('before') : entry.path, copy('proposed')))) {
+      $.ui.toast('Could not start VS Code')
     }
-    $.ui.toast('Could not start VS Code')
   } catch {
     $.ui.toast('Could not prepare the whole-file view')
   }
@@ -401,6 +449,8 @@ const actionsFor = ($: EngineInterface): GateActions => ({
   choose,
   viewFile: id => viewFile($, id),
   toggleContext: id => toggleContext($, id),
+  step: (id, isFlagged) => stepChunk($, id, isFlagged),
+  viewChunk: id => viewChunk($, id),
 })
 
 const run = async ($: EngineInterface, argv: string[], cwd?: string): Promise<string | undefined> => {
@@ -415,9 +465,20 @@ const run = async ($: EngineInterface, argv: string[], cwd?: string): Promise<st
 
 // The work tree under `root` as a git tree, untracked files included, built in
 // a throwaway index so the repository's own index and files stay untouched.
-const gitTree = async ($: EngineInterface, root: string): Promise<string | undefined> => {
+// VS Code's side-by-side comparison of two files; false when it would not start.
+const compare = async ($: EngineInterface, left: string, right: string): Promise<boolean> => {
+  for (const code of VS_CODE) {
+    if ((await run($, [code, '--diff', left, right])) !== undefined) {
+      return true
+    }
+  }
+
+  return false
+}
+
+const gitTree = async ($: EngineInterface, root: string, name = 'drive'): Promise<string | undefined> => {
   const dir = await copiesDir($)
-  const index = `${dir}/drive-index`
+  const index = `${dir}/${name.replace(/[^\w-]/g, '_')}-index`
   const inIndex = (...git: string[]) => run($, ['env', `GIT_INDEX_FILE=${index}`, 'git', ...git], root)
   await run($, ['mkdir', '-m', '700', '-p', dir])
   const own = (await run($, ['git', 'rev-parse', '--path-format=absolute', '--git-path', 'index'], root))?.trim()
@@ -478,6 +539,18 @@ const resolvePath = async (
   return matches[0] ?? direct
 }
 
+const tally = (patch: string) => {
+  const rows = patch.split('\n')
+
+  return {
+    files: rows.filter(row => row.startsWith('diff --git ')).length,
+    added: rows.filter(row => row.startsWith('+') && !row.startsWith('+++')).length,
+    removed: rows.filter(row => row.startsWith('-') && !row.startsWith('---')).length,
+  }
+}
+
+const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? '' : 's'}`
+
 const startDrive = async ($: EngineInterface, args: string) => {
   const cwd = await $.session.cwd()
   const named: string[] = []
@@ -535,14 +608,8 @@ const driveChanges = async ($: EngineInterface, started: PairDrive): Promise<Cha
     if (text === undefined) {
       return undefined
     }
-    const rows = text.split('\n')
 
-    return {
-      text,
-      files: rows.filter(row => row.startsWith('diff --git ')).length,
-      added: rows.filter(row => row.startsWith('+') && !row.startsWith('+++')).length,
-      removed: rows.filter(row => row.startsWith('-') && !row.startsWith('---')).length,
-    }
+    return { text, ...tally(text) }
   }
 
   const changes: Changes = { text: '', files: 0, added: 0, removed: 0 }
@@ -595,6 +662,139 @@ const requestReview = async ($: EngineInterface, note: string) => {
   return { text: `Sent ${size} to Claude for review.`, context: [typed] }
 }
 
+// The pane shows whatever is still held, and closes when nothing is.
+const settleGate = async ($: EngineInterface) => {
+  if (held.size === 0) {
+    await $.ui.close({ id: GATE })
+  } else {
+    await showGate($)
+  }
+}
+
+// Where a Bash command is about to run: the repository and its work tree now.
+// A command that opens with `cd <folder>` is taken to run in that folder.
+const beforeCommand = async ($: EngineInterface, id: string, command: string) => {
+  if (!isBashReviewed || !(await read($, isOn)) || (await $.session.surfaces()).length === 0) {
+    return undefined
+  }
+  const cwd = await $.session.cwd()
+  const moved = /^\s*cd\s+(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))/.exec(command)
+  const target = moved?.[1] ?? moved?.[2] ?? moved?.[3]
+  const base = target === undefined ? cwd : target.startsWith('/') ? target : `${cwd}/${target}`
+  const root = (await run($, ['git', 'rev-parse', '--show-toplevel'], base))?.trim() || undefined
+  const tree = root === undefined ? undefined : await gitTree($, root, id)
+
+  return root === undefined || tree === undefined ? undefined : { root, tree }
+}
+
+const stepChunk = async ($: EngineInterface, id: string, isFlagged: boolean) => {
+  const list = await update($, commands, all =>
+    all.map(one =>
+      one.id !== id ? one : { ...one, at: one.at + 1, flagged: isFlagged ? [...one.flagged, one.at] : one.flagged },
+    ),
+  )
+  const mine = list.find(one => one.id === id)
+  if (mine === undefined) {
+    return
+  }
+  if (isFlagged) {
+    flags.get(id)?.push(mine.at - 1)
+  }
+  if (mine.at >= mine.chunks.length) {
+    choose(id, 'approve')
+  }
+}
+
+const viewChunk = async ($: EngineInterface, id: string) => {
+  const entry = (await read($, commands)).find(one => one.id === id)
+  const chunk = entry?.chunks[entry.at]
+  if (entry === undefined || chunk === undefined) {
+    return
+  }
+  try {
+    const dir = await copiesDir($, id)
+    const name = chunk.path.split('/').at(-1) ?? 'file'
+    const copy = (tag: string) => `${dir}/${name.replace(/(\.[^.]*)?$/, `.${tag}$1`)}`
+    const current = `${entry.root}/${chunk.path}`
+    const isThere = await $.fs.exists(current)
+    await run($, ['mkdir', '-m', '700', '-p', await copiesDir($)])
+    await $.fs.write(copy('before'), (await run($, ['git', 'show', `${entry.before}:${chunk.path}`], entry.root)) ?? '')
+    if (!isThere) {
+      await $.fs.write(copy('after'), '')
+    }
+    if (!(await compare($, copy('before'), isThere ? current : copy('after')))) {
+      $.ui.toast('Could not start VS Code')
+    }
+  } catch {
+    $.ui.toast('Could not prepare the whole-file view')
+  }
+}
+
+// Walks the user through what a finished Bash command changed, holding its
+// result meanwhile; resolves the note Claude reads with that result.
+const reviewCommand = async (
+  $: EngineInterface,
+  signal: AbortSignal,
+  id: string,
+  command: string,
+  watch: { root: string; tree: string },
+): Promise<string | undefined> => {
+  const after = await gitTree($, watch.root, id)
+  const patch =
+    after === undefined || after === watch.tree
+      ? undefined
+      : await run($, ['git', 'diff', '--no-color', '--no-ext-diff', watch.tree, after], watch.root)
+  const chunks = patch === undefined ? [] : chunksOf(patch, maxLines)
+  if (patch === undefined || chunks.length === 0) {
+    return undefined
+  }
+  const entry: PairCommandReview = {
+    id,
+    command: (command.split('\n')[0] ?? '').slice(0, 200),
+    root: watch.root,
+    before: watch.tree,
+    ...tally(patch),
+    chunks: chunks.slice(0, CHUNKS_MAX),
+    hidden: Math.max(0, chunks.length - CHUNKS_MAX),
+    at: 0,
+    flagged: [],
+  }
+  held.add(id)
+  flags.set(id, [])
+  try {
+    await update($, commands, list => [...list, entry])
+    await showGate($)
+    while (!decisions.has(id) && !signal.aborted) {
+      await $.state.get(tick)
+    }
+  } finally {
+    held.delete(id)
+    await removeCopies($, id).catch(() => undefined)
+    await update($, commands, list => list.filter(one => one.id !== id))
+    await settleGate($)
+  }
+
+  const decision = decisions.get(id)
+  decisions.delete(id)
+  const flagged = (flags.get(id) ?? []).flatMap(index => entry.chunks[index] ?? [])
+  flags.delete(id)
+  const size = `${plural(entry.files, 'file')}, +${entry.added} -${entry.removed} lines`
+  if (decision === 'talk') {
+    return `pair: the user closed the review of what this command changed (${size}) to talk about it in the main chat. Stop and wait for their message. Do not change or undo those changes yet.`
+  }
+  if (decision !== 'approve') {
+    return undefined
+  }
+  if (flagged.length === 0) {
+    return `pair: the user reviewed what this command changed (${size}).`
+  }
+
+  return [
+    `pair: the user reviewed what this command changed (${size}) and wants to discuss the ${plural(flagged.length, 'change')} below before you go on. Explain each in plain language, then stop and wait for their reply. Do not change or undo them yet.`,
+    ...flagged.map(chunk => `${chunk.path}\n${chunk.diff}`),
+  ].join('\n\n')
+}
+
 const review = async (
   $: EngineInterface,
   signal: AbortSignal,
@@ -634,12 +834,8 @@ const review = async (
     wholes.delete(call.id)
     // A copy that cannot be removed must not undo the user's decision.
     await removeCopies($, call.id).catch(() => undefined)
-    const rest = await update($, pending, list => list.filter(one => one.id !== call.id))
-    if (rest.length === 0) {
-      await $.ui.close({ id: GATE })
-    } else {
-      await showGate($)
-    }
+    await update($, pending, list => list.filter(one => one.id !== call.id))
+    await settleGate($)
   }
 
   const decision = decisions.get(call.id)
@@ -693,6 +889,14 @@ const helpText = (isPairOn: boolean, skillPath: string | undefined): string =>
     '  Esc                    refuse it; Claude waits for you in the chat',
     '  The keys work while the review has the keyboard. Otherwise click a button, or press ctrl+x tab first.',
     '',
+    'When a command changes files (pair mode on, git repositories only)',
+    '  After a Bash command changes files, its result waits while you step through what it changed.',
+    '  1  Next                this change is fine; show the next one',
+    '  2  Discuss             mark this change; Claude explains the marked ones when you finish',
+    '  3  Accept the rest     stop stepping and let Claude go on',
+    '  5  Whole file          compare the whole file, before and after, in VS Code',
+    '  Esc                    stop here; Claude waits for you in the chat',
+    '',
     'When you edit',
     `  /pair drive [files]    take over: your files are noted and your editor (${editor}) opens`,
     '  /pair review [note]    hand back: Claude reviews what you changed, with your note',
@@ -716,6 +920,7 @@ const helpText = (isPairOn: boolean, skillPath: string | undefined): string =>
     'Settings, changed in /config',
     `  Review size target     ${maxLines} changed lines (maxReviewLines)`,
     `  Editor command         ${editor} (editor)`,
+    `  Review command changes ${isBashReviewed ? 'on' : 'off'} (reviewBash)`,
     '',
     'Only Edit and Write are held. Bash and other tools can still change files.',
   ].join('\n')
@@ -726,6 +931,9 @@ export const register: Register = (on, options) => {
   }
   if (typeof options.editor === 'string' && options.editor.trim() !== '') {
     editor = options.editor.trim()
+  }
+  if (typeof options.reviewBash === 'boolean') {
+    isBashReviewed = options.reviewBash
   }
 
   on('session.start', async ($, e, next) => {
@@ -775,6 +983,7 @@ export const register: Register = (on, options) => {
     })
     // No hold outlives the module that ran it.
     await update($, pending, () => [])
+    await update($, commands, () => [])
     await $.ui.close({ id: GATE })
     await removeCopies($).catch(() => undefined)
 
@@ -825,12 +1034,25 @@ export const register: Register = (on, options) => {
       : { ...ran, context: [...(ran.context ?? []), verdict.note] }
   }).catch(($, e, next) => (next.called ? next(e) : { deny: HOLD_FAILED }))
 
+  // A Bash command's changes are on disk before anyone sees them, so they are
+  // not held: its result is, while the user steps through what it changed.
+  on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
+    const watch = e.run_in_background === true ? undefined : await beforeCommand($, e.tool_use_id, e.command)
+    const ran = await next(e)
+    if (watch === undefined || ran.deny !== undefined) {
+      return ran
+    }
+    const note = await reviewCommand($, next.signal, e.tool_use_id, e.command, watch).catch(() => undefined)
+
+    return note === undefined ? ran : { ...ran, context: [...(ran.context ?? []), note] }
+  })
+
   on('ui.close', { id: GATE }, async ($, e, next) => {
     const closed = await next(e)
     if (e.origin.kind === 'person') {
-      const [head] = await read($, pending)
-      if (head !== undefined) {
-        choose(head.id, 'talk')
+      const shown = (await read($, pending))[0] ?? (await read($, commands))[0]
+      if (shown !== undefined) {
+        choose(shown.id, 'talk')
       }
     }
 
@@ -963,11 +1185,15 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: GATE }, async ($, e) => {
     const kit = $.ui.resolve(e)
     const [head, ...rest] = await read($, pending)
-    if (head === undefined) {
-      return <kit.Text dimColor>No edit is waiting for review.</kit.Text>
+    const [changed, ...more] = await read($, commands)
+    if (head !== undefined) {
+      return gateTree(kit, head, rest.length, 'Esc: not applied, talk in the chat.', actionsFor($))
+    }
+    if (changed !== undefined) {
+      return commandTree(kit, changed, more.length, 'Esc: stop here and talk in the chat.', actionsFor($))
     }
 
-    return gateTree(kit, head, rest.length, 'Esc: not applied, talk in the chat.', actionsFor($))
+    return <kit.Text dimColor>Nothing is waiting for review.</kit.Text>
   })
 
   on('ui.render', { component: 'Pane', requestId: BOOK }, async ($, e) => {
@@ -1000,8 +1226,13 @@ export const register: Register = (on, options) => {
     }
     const kit = $.ui.resolve(e)
     const [head, ...rest] = await read($, pending)
-    if (head !== undefined && (await read($, isGateInBand))) {
+    const [changed, ...more] = await read($, commands)
+    const isInBand = await read($, isGateInBand)
+    if (head !== undefined && isInBand) {
       return gateTree(kit, head, rest.length, 'Shown here because the pane does not fit.', actionsFor($))
+    }
+    if (changed !== undefined && isInBand) {
+      return commandTree(kit, changed, more.length, 'Shown here because the pane does not fit.', actionsFor($))
     }
     const book = await read($, notebook)
 

@@ -2,7 +2,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import { applyEdit, unifiedDiff } from '../hooks/diff'
+import { applyEdit, chunksOf, unifiedDiff } from '../hooks/diff'
 
 const HOME = '/home/dev'
 const SKILL_PATH = `${HOME}/.claude/skills/collaborate/SKILL.md`
@@ -527,6 +527,135 @@ describe('/pair', () => {
   })
 })
 
+const PATCH = [
+  'diff --git a/a.ts b/a.ts',
+  'index 111..222 100644',
+  '--- a/a.ts',
+  '+++ b/a.ts',
+  '@@ -1,3 +1,4 @@',
+  ' one',
+  '-two',
+  '+TWO',
+  '+extra',
+  ' three',
+  'diff --git a/b.ts b/b.ts',
+  'new file mode 100644',
+  'index 000..333',
+  '--- /dev/null',
+  '+++ b/b.ts',
+  '@@ -0,0 +1 @@',
+  '+new',
+  '',
+].join('\n')
+
+// A repository at /repo whose work tree differs at every snapshot, unless quiet.
+const repository = (isQuiet = false) => {
+  let trees = 0
+
+  return (argv: readonly string[]) => {
+    const line = argv.join(' ')
+    if (line === 'git rev-parse --show-toplevel') {
+      return { stdout: '/repo\n' }
+    }
+    if (line.endsWith(' git write-tree')) {
+      trees += isQuiet ? 0 : 1
+
+      return { stdout: `tree${trees}\n` }
+    }
+
+    return line.startsWith('git diff ') ? { stdout: PATCH } : undefined
+  }
+}
+
+const heldCommand = async ($: Engine, clock: ReturnType<typeof mock.clock>) => {
+  const call = $.tool.call({ tool: 'Bash', command: 'make fmt' })
+  let outcome: unknown = 'held'
+  void call.then(settled => {
+    outcome = settled
+  })
+  await clock.settle()
+
+  return { call, outcome: () => outcome }
+}
+
+describe('what a command changed', () => {
+  test('its result waits while the changes are stepped through, and Claude is told which to discuss', async ($, on) => {
+    const { clock } = world(on, {}, true, repository())
+    const { call, outcome } = await heldCommand($, clock)
+
+    expect(outcome()).toBe('held')
+    const ui = await gatePane($)
+    expect(await ui.find({ type: 'Text', text: 'Bash changed 2 files, +3 -1 lines' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: '$ make fmt' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'Change 1 of 2:' })).toBeDefined()
+    expect((await ui.find({ type: 'Code' }))?.text).toBe('@@ -1,3 +1,4 @@\n one\n-two\n+TWO\n+extra\n three')
+
+    await ui.press({ key: 'next' })
+    expect(await ui.find({ type: 'Text', text: 'Change 2 of 2:' })).toBeDefined()
+    expect((await ui.find({ type: 'Code' }))?.text).toBe('@@ -0,0 +1,1 @@\n+new')
+    expect(outcome()).toBe('held')
+
+    await ui.press({ key: 'flag' })
+    const answer = await call
+    expect(answer).toMatchObject({ result: 'ran' })
+    const [note = ''] = answer.context ?? []
+    expect(note).toContain('wants to discuss the 1 change below')
+    expect(note).toContain('b.ts\n@@ -0,0 +1,1 @@\n+new')
+    expect(note).not.toContain('+TWO')
+  })
+
+  test('Accept the rest lets Claude go on with a short note', async ($, on) => {
+    const { clock } = world(on, {}, true, repository())
+    const { call } = await heldCommand($, clock)
+
+    await (await gatePane($)).press({ key: 'rest' })
+
+    expect((await call).context).toEqual(['pair: the user reviewed what this command changed (2 files, +3 -1 lines).'])
+  })
+
+  test('Whole file compares the file before the command with the file now', async ($, on) => {
+    const { clock, commands } = world(on, { '/repo/a.ts': 'one\nTWO\nextra\nthree\n' }, true, repository())
+    const { call } = await heldCommand($, clock)
+
+    const ui = await gatePane($)
+    await ui.press({ key: 'whole' })
+    expect(commands).toContainEqual(['git', 'show', 'tree1:a.ts'])
+    const [program, flag, before, now] = commands.at(-1) ?? []
+    expect([program, flag, now]).toEqual([VS_CODE_APP, '--diff', '/repo/a.ts'])
+    expect(before).toEndWith('/a.before.ts')
+
+    await ui.press({ key: 'rest' })
+    await call
+  })
+
+  test('a command that changed nothing is not reviewed', async ($, on) => {
+    const { opened } = world(on, {}, true, repository(true))
+
+    const answer = await $.tool.call({ tool: 'Bash', command: 'ls' })
+
+    expect(answer).toMatchObject({ result: 'ran' })
+    expect(answer.context).toBeUndefined()
+    expect(opened).toHaveLength(0)
+  })
+
+  test('with pair mode off no snapshot is taken', async ($, on) => {
+    const { commands } = world(on, {}, true, repository())
+    await command($, 'pair', 'off')
+
+    await $.tool.call({ tool: 'Bash', command: 'make fmt' })
+
+    expect(commands.filter(argv => argv.includes('git'))).toHaveLength(0)
+  })
+
+  test('with the setting off no snapshot is taken', { options: { reviewBash: false } }, async ($, on) => {
+    const { commands } = world(on, {}, true, repository())
+
+    await $.tool.call({ tool: 'Bash', command: 'make fmt' })
+
+    expect(commands.filter(argv => argv.includes('git'))).toHaveLength(0)
+  })
+})
+
 describe('/pair help', () => {
   test('lists every command and button, and the settings as they are', { options: { maxReviewLines: 12, editor: 'zed' } }, async ($, on) => {
     world(on, { [SKILL_PATH]: SKILL_TEXT })
@@ -745,6 +874,34 @@ describe('diff', () => {
     expect(cut.text.split('\n')[0]).toMatch(/^@@ -0,0 \+1,(\d+) @@$/)
     expect(cut.text.split('\n').length - 1 + cut.hidden).toBe(50)
     expect(cut.text.length).toBeLessThanOrEqual(80)
+  })
+
+  test('a long change in a git diff is cut into chunks, each with its own line numbers', () => {
+    const added = Array.from({ length: 10 }, (_, index) => `+line ${index + 1}`)
+    const patch = ['diff --git a/x.txt b/x.txt', '--- a/x.txt', '+++ b/x.txt', '@@ -1,2 +1,12 @@', ' top', ...added, ' bottom', ''].join('\n')
+
+    const chunks = chunksOf(patch, 2)
+
+    expect(chunks.map(chunk => chunk.diff.split('\n')[0])).toEqual([
+      '@@ -1,1 +1,3 @@',
+      '@@ -1,0 +4,2 @@',
+      '@@ -1,0 +6,2 @@',
+      '@@ -1,0 +8,2 @@',
+      '@@ -1,0 +10,2 @@',
+    ])
+    expect(chunks.every(chunk => chunk.path === 'x.txt' && chunk.added === 2 && chunk.removed === 0)).toBe(true)
+  })
+
+  test('lines that replace removed ones stay in the same chunk', () => {
+    const patch = ['diff --git a/x.txt b/x.txt', '--- a/x.txt', '+++ b/x.txt', '@@ -1,3 +1,3 @@', '-a', '-b', '-c', '+A', '+B', '+C', ''].join('\n')
+
+    expect(chunksOf(patch, 3).map(chunk => [chunk.added, chunk.removed])).toEqual([[3, 3]])
+  })
+
+  test('a file git shows no text for is one chunk with no diff', () => {
+    const patch = 'diff --git a/i.png b/i.png\nindex 1..2 100644\nBinary files a/i.png and b/i.png differ\n'
+
+    expect(chunksOf(patch, 40)).toEqual([{ path: 'i.png', diff: '', added: 0, removed: 0 }])
   })
 
   test('an edit applies as the Edit tool applies it', () => {
