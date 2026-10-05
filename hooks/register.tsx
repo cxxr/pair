@@ -8,9 +8,11 @@ import type {
   PairLogEntry,
   PairNotebook,
   PairPendingEdit,
+  PairTdd,
 } from '../types'
 import { applyEdit, chunksOf, unifiedDiff } from './diff'
 import type { FileDiff } from './diff'
+import { isTestFile } from './sides'
 
 type Decision = 'approve' | 'discuss' | 'skip' | 'split' | 'talk' | 'release'
 // A refusal, or leave to run the edit: with a note when the user approved it,
@@ -63,6 +65,8 @@ const OUTCOMES: Record<Decision | 'none', string> = {
   release: 'let through when pair mode was turned off',
   none: 'interrupted before a decision',
 }
+const TDD_USAGE =
+  'TDD is off. /pair tdd claude [what to test]: Claude writes the tests and you write the code. /pair tdd me [files]: you write the tests and Claude writes the code.'
 const SUMMARY_RULES =
   'pair: the user asked for a summary of this session. Write it for someone who was not here: what was decided, what is still open, and what changed, in a form that could be pasted into a pull request description. Use the records below and what you know from the conversation, and say so where the two disagree. Do not change any files.'
 const NOT_STORED = 'not stored'
@@ -78,6 +82,7 @@ const modNote = () => [
   'If the user chooses Discuss, explain your reasoning and wait for their reply; if they choose Skip, drop the edit; if they choose Split, send it again as smaller steps.',
   `Keep each Edit or Write to about ${maxLines} changed lines and one idea, in steps that each leave the code working; a new file may be longer.`,
   'Record what you both decide, and what is still open, with mcp__pair__notebook.',
+  'If the user asks to do TDD, or to take over the typing, call mcp__pair__tdd or mcp__pair__handover yourself; do not ask them to type a command.',
 ].join(' ')
 const HOLD_FAILED =
   'pair: the review hold failed, so this edit was not applied. Tell the user; they can run /pair off to edit without review.'
@@ -106,6 +111,7 @@ const log = atom({ plugin: 'pair', key: 'log' } as const, [])
 const isGateInBand = atom({ plugin: 'pair', key: 'isGateInBand' } as const, false)
 const hasSentInstructions = atom({ plugin: 'pair', key: 'hasSentInstructions' } as const, false)
 const drive = atom({ plugin: 'pair', key: 'drive' } as const, null)
+const tdd = atom({ plugin: 'pair', key: 'tdd' } as const, null)
 const touched = atom({ plugin: 'pair', key: 'touched' } as const, [])
 const explanations = atom({ plugin: 'pair', key: 'explanations' } as const, {})
 const tick = { plugin: 'pair', key: 'tick' } as const
@@ -340,6 +346,7 @@ const gateTree = (
       <Button key="file" plain label={head.path} onPress={() => actions.viewFile(head.id)} />
     </Box>
     <Text>{head.why}</Text>
+    {head.warning !== '' && <Text bold>{head.warning}</Text>}
     {head.note !== '' && <Text dimColor>{head.note}</Text>}
     {head.diff === '' ? (
       <Text dimColor>No change to the file's text.</Text>
@@ -718,6 +725,111 @@ const driveChanges = async ($: EngineInterface, started: PairDrive): Promise<Cha
   return changes
 }
 
+// What Claude is told when TDD starts: the sides, the rhythm, and how to pass the turn.
+const tddRules = (tests: PairTdd['tests']) =>
+  [
+    `pair: TDD mode is on. ${tests === 'claude' ? 'You write the tests and the user writes the code.' : 'The user writes the tests and you write the code.'}`,
+    'Work one round at a time: one failing test, then the smallest change that makes it pass, then run the tests and say plainly whether they pass.',
+    'Only write a test for behaviour the user has agreed to; if the next behaviour is not agreed, propose one and ask.',
+    `Stay on your side: do not edit ${tests === 'claude' ? 'the code under test' : 'test files'}. If something there needs changing, say so and let the user do it.`,
+    'When your part of a round is done, call mcp__pair__handover with the files the user will work in, then stop. The user hands back with /pair review.',
+  ].join(' ')
+
+// What Claude is told when the user hands back in TDD mode.
+const tddReviewRules = (tests: PairTdd['tests']) =>
+  tests === 'user'
+    ? 'pair: TDD round. The user wrote the test below. Run it first: if it already passes, or fails for a reason other than the missing behaviour, say so and stop. Otherwise write the smallest change that makes it pass, run the tests, say plainly whether they pass, then call mcp__pair__handover so the user can write the next test. Do not edit the test.'
+    : "pair: TDD round. The user wrote the code below to pass your test. Run the tests and say plainly whether they pass. If they fail, say what fails and call mcp__pair__handover so the user can fix it. If they pass, point out anything worth changing. Then, if the next behaviour is agreed, write its failing test, run it to show it fails, and call mcp__pair__handover; if it is not, propose what to test next and ask. Do not edit the user's code."
+
+const tddSides = (tests: PairTdd['tests']) =>
+  tests === 'claude' ? 'Claude writes the tests, you write the code' : 'you write the tests, Claude writes the code'
+
+const tddStatus = (mode: PairTdd) =>
+  mode.turn === 'user'
+    ? `pair: TDD, your turn to write the ${mode.tests === 'user' ? 'test' : 'code'}; /pair review hands back`
+    : `pair: TDD, Claude is writing the ${mode.tests === 'claude' ? 'test' : 'code'}`
+
+// The line a review carries when Claude's edit is on the user's side of the round.
+const tddWarning = (tests: PairTdd['tests'], isTest: boolean) =>
+  tests === 'claude' && !isTest
+    ? 'TDD: Claude writes the tests in this session, and this is not a test file.'
+    : tests === 'user' && isTest
+      ? 'TDD: you write the tests in this session, and this edits a test file.'
+      : ''
+
+// Starts TDD with one side writing the tests. `extra` is what to test when that
+// is Claude, and the files to open when it is the user, who then takes over.
+const startTdd = async ($: EngineInterface, tests: PairTdd['tests'], extra: string, isFromTool: boolean) => {
+  if (tests === 'claude') {
+    const mode: PairTdd = { tests, turn: 'claude' }
+    await update($, tdd, () => mode)
+    $.ui.status(tddStatus(mode))
+    if (!isFromTool) {
+      submitSoon(
+        $,
+        `Let's do TDD: you write the tests and I write the code. ${extra === '' ? 'Start with what we were just discussing.' : extra}`,
+        'Could not start TDD. Send any prompt and Claude will pick it up.',
+      )
+    }
+
+    return {
+      text: `TDD is on: ${tddSides(tests)}.`,
+      context: [tddRules(tests)],
+      next: 'Write the first failing test now.',
+    }
+  }
+  const mode: PairTdd = { tests, turn: 'user' }
+  await update($, tdd, () => mode)
+  const driving = await startDrive($, extra)
+  $.ui.status(tddStatus(mode))
+
+  return {
+    text: `TDD is on: ${tddSides(tests)}. ${driving.text} Write one failing test before you hand back.`,
+    context: [tddRules(tests), DRIVE_NOTE],
+    next: `The user is writing the first test. They were told: "${driving.text}" Stop and wait for them.`,
+  }
+}
+
+const tddCommand = async ($: EngineInterface, args: string) => {
+  const [word = '', ...rest] = args.trim().split(/\s+/)
+  const mode = await read($, tdd)
+  const swapped = mode === null ? '' : mode.tests === 'claude' ? 'me' : 'claude'
+  const who = word.toLowerCase() === 'swap' ? swapped : word.toLowerCase()
+  if (who === 'claude' || who === 'me') {
+    const { text, context } = await startTdd($, who === 'me' ? 'user' : 'claude', rest.join(' '), false)
+
+    return { text, context }
+  }
+  if (who === 'off') {
+    await update($, tdd, () => null)
+    $.ui.status(undefined)
+
+    return { text: 'TDD is off.', context: ['pair: the user turned TDD mode off.'] }
+  }
+  if (word === '' && mode !== null) {
+    return { text: `TDD is on: ${tddSides(mode.tests)}. It is ${mode.turn === 'user' ? 'your' : "Claude's"} turn.` }
+  }
+
+  return { text: TDD_USAGE }
+}
+
+// Hands the user the keyboard on Claude's initiative: what /pair drive does.
+const handOver = async ($: EngineInterface, files: string): Promise<string> => {
+  const driving = await startDrive($, files)
+  if (!('context' in driving)) {
+    return `Could not hand over: ${driving.text} Ask the user which files they will work in.`
+  }
+  const mode = await read($, tdd)
+  if (mode !== null) {
+    const turned: PairTdd = { ...mode, turn: 'user' }
+    await update($, tdd, () => turned)
+    $.ui.status(tddStatus(turned))
+  }
+  $.ui.toast('Your turn. Run /pair review when you are done.')
+
+  return `Handed over. The user was told: "${driving.text}" Stop and wait; they hand back with /pair review.`
+}
+
 // Notes one review for the session summary.
 const record = ($: EngineInterface, entry: PairLogEntry) =>
   update($, log, list => [...list, entry].slice(-LOG_MAX))
@@ -767,10 +879,15 @@ const requestReview = async ($: EngineInterface, note: string) => {
     return { text: 'Nothing has changed since /pair drive. Save your files, then run /pair review again.' }
   }
   await update($, drive, () => null)
-  $.ui.status(undefined)
+  const mode = await read($, tdd)
+  const turned: PairTdd | null = mode === null ? null : { ...mode, turn: 'claude' }
+  if (turned !== null) {
+    await update($, tdd, () => turned)
+  }
+  $.ui.status(turned === null ? undefined : tddStatus(turned))
   const size = `${changes.files} file${changes.files === 1 ? '' : 's'}, +${changes.added} -${changes.removed} lines`
   const typed = [
-    REVIEW_RULES,
+    mode === null ? REVIEW_RULES : tddReviewRules(mode.tests),
     changes.text.length > REVIEW_BUDGET ? `The diff is cut at ${REVIEW_BUDGET} characters; read the files for the rest.` : '',
     changes.text.slice(0, REVIEW_BUDGET),
   ]
@@ -781,9 +898,13 @@ const requestReview = async ($: EngineInterface, note: string) => {
     size: `+${changes.added} -${changes.removed}`,
     outcome: 'sent to Claude for review',
   })
+  const opening =
+    mode === null
+      ? `Review the changes I just typed myself (${size}).`
+      : `Here is my ${mode.tests === 'user' ? 'test' : 'code'} (${size}).`
   submitSoon(
     $,
-    `Review the changes I just typed myself (${size}).${note === '' ? '' : ` ${note}`}`,
+    `${opening}${note === '' ? '' : ` ${note}`}`,
     'Could not start the review. Send any prompt and Claude will see your changes.',
   )
 
@@ -958,7 +1079,19 @@ const review = async (
   await update($, explanations, ({ [call.path]: _used, ...rest }) => rest)
 
   const { text: diff, note, whole, added, removed } = await call.describe()
-  const entry: PairPendingEdit = { id: call.id, tool: call.tool, path: call.path, why, diff, note, isWide: false }
+  const mode = await read($, tdd)
+  const root = await $.session.root()
+  const local = call.path.startsWith(`${root}/`) ? call.path.slice(root.length + 1) : call.path.split('/').slice(-2).join('/')
+  const entry: PairPendingEdit = {
+    id: call.id,
+    tool: call.tool,
+    path: call.path,
+    why,
+    diff,
+    note,
+    warning: mode === null ? '' : tddWarning(mode.tests, isTestFile(local)),
+    isWide: false,
+  }
   held.add(call.id)
   if (whole !== undefined) {
     wholes.set(call.id, whole)
@@ -1048,6 +1181,15 @@ const helpText = (isPairOn: boolean, skillPath: string | undefined): string =>
     '  5  Whole file          compare the whole file, before and after, in VS Code',
     '  Esc                    stop here; Claude waits for you in the chat',
     '',
+    'TDD: one side writes a failing test, the other makes it pass',
+    '  /pair tdd claude [what]  Claude writes the tests, you write the code',
+    '  /pair tdd me [files]     you write the tests, Claude writes the code; you take over at once',
+    '  /pair tdd swap           trade sides',
+    '  /pair tdd off            stop; turning pair mode off stops it too',
+    '  /pair tdd                say who is on which side and whose turn it is',
+    '  You can also just ask in words ("let us do TDD, you write the tests"): Claude starts it and hands you the keyboard itself.',
+    '  You hand back with /pair review [note]. A review warns you when Claude edits a file on your side.',
+    '',
     'When you edit',
     `  /pair drive [files]    take over: your files are noted and your editor (${editor}) opens`,
     '  /pair review [note]    hand back: Claude reviews what you changed, with your note',
@@ -1093,7 +1235,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'pair',
       description: 'Turn pairing mode on or off, or take over the typing and have Claude review it',
-      argumentHint: '[on|off|status|help | drive [files] | review [note] | summary [note]]',
+      argumentHint: '[on|off|status|help | drive [files] | review [note] | tdd claude|me|swap|off | summary [note]]',
       immediate: true,
     })
     await $.command.register({
@@ -1119,6 +1261,40 @@ export const register: Register = (on, options) => {
           id: { type: 'integer', description: 'The entry number shown as #id.' },
         },
         required: ['action'],
+      },
+    })
+    await $.tool.register({
+      name: 'tdd',
+      description:
+        'Start, swap or stop TDD mode when the user asks for it in their own words, for example "let\'s do TDD, you write the tests". `tests` says who writes the tests; the other side writes the code. Call this yourself; do not ask the user to type /pair tdd.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          tests: {
+            type: 'string',
+            enum: ['claude', 'user', 'swap', 'off'],
+            description: 'claude: you write the tests. user: they do, and take over the keyboard at once. swap: trade sides. off: stop.',
+          },
+          files: {
+            type: 'string',
+            description: 'With tests: user, the files they will work in, separated by spaces. Optional inside a git repository.',
+          },
+        },
+        required: ['tests'],
+      },
+    })
+    await $.tool.register({
+      name: 'handover',
+      description:
+        'Hand the keyboard to the user, as /pair drive does: call it when they ask to take over the typing, and in TDD mode when your part of a round is done. It notes how the files stand and opens their editor. Then stop and wait; they hand back with /pair review.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          files: {
+            type: 'string',
+            description: 'The files the user will work in, separated by spaces. Optional inside a git repository.',
+          },
+        },
       },
     })
     await $.tool.register({
@@ -1215,6 +1391,33 @@ export const register: Register = (on, options) => {
 
   on('tool.check', { tool: 'mcp__pair__notebook' }, () => ({ decision: 'allow' }))
   on('tool.check', { tool: 'mcp__pair__explain_edit' }, () => ({ decision: 'allow' }))
+  on('tool.check', { tool: 'mcp__pair__tdd' }, () => ({ decision: 'allow' }))
+  on('tool.check', { tool: 'mcp__pair__handover' }, () => ({ decision: 'allow' }))
+
+  on('tool.call', { tool: 'mcp__pair__tdd' }, async ($, e) => {
+    const input = e as unknown as { tests?: unknown; files?: unknown }
+    const mode = await read($, tdd)
+    const swapped = mode === null ? undefined : mode.tests === 'claude' ? 'user' : 'claude'
+    const tests = input.tests === 'swap' ? swapped : input.tests
+    if (tests === 'off') {
+      await update($, tdd, () => null)
+      $.ui.status(undefined)
+
+      return { result: 'TDD mode is off.' }
+    }
+    if (tests !== 'claude' && tests !== 'user') {
+      return { result: 'pair: tests must be claude, user, off, or swap while TDD is on.' }
+    }
+    const { next } = await startTdd($, tests, typeof input.files === 'string' ? input.files : '', true)
+
+    return { result: `${tddRules(tests)} ${next}` }
+  })
+
+  on('tool.call', { tool: 'mcp__pair__handover' }, async ($, e) => {
+    const input = e as unknown as { files?: unknown }
+
+    return { result: await handOver($, typeof input.files === 'string' ? input.files : '') }
+  })
 
   on('tool.call', { tool: 'mcp__pair__notebook' }, async ($, e) => {
     const input = e as unknown as { action?: unknown; text?: unknown; id?: unknown }
@@ -1247,6 +1450,9 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'pair' }, async ($, e) => {
     const [verb = '', ...rest] = e.args.trim().split(/\s+/)
+    if (verb.toLowerCase() === 'tdd') {
+      return tddCommand($, rest.join(' '))
+    }
     if (verb.toLowerCase() === 'summary') {
       return requestSummary($, e.args.trim().slice(verb.length).trim())
     }
@@ -1274,7 +1480,7 @@ export const register: Register = (on, options) => {
     }
     if (word !== '' && word !== 'on' && word !== 'off') {
       return {
-        text: 'Usage: /pair [on|off|status|help] | drive [files] | review [note] | summary [note]. /pair help explains each.',
+        text: 'Usage: /pair [on|off|status|help] | drive [files] | review [note] | tdd claude|me|swap|off | summary [note]. /pair help explains each.',
       }
     }
 
@@ -1284,8 +1490,16 @@ export const register: Register = (on, options) => {
         choose(id, 'release')
       }
       $.ui.status(undefined)
+      // TDD is part of pairing: it ends with it.
+      const wasTdd = (await read($, tdd)) !== null
+      if (wasTdd) {
+        await update($, tdd, () => null)
+      }
 
-      return { text: 'Pair mode is off. Edits run without review.', context: [OFF_NOTE] }
+      return {
+        text: `Pair mode is off. Edits run without review.${wasTdd ? ' TDD is off too.' : ''}`,
+        context: wasTdd ? [OFF_NOTE, 'pair: the user turned TDD mode off.'] : [OFF_NOTE],
+      }
     }
 
     return { text: `Pair mode is on. Edit and Write wait for your review. ${skillLine}`, context: [ON_NOTE] }
@@ -1322,6 +1536,7 @@ export const register: Register = (on, options) => {
   on('session.end', async ($, e, next) => {
     await update($, hasSentInstructions, () => false)
     await update($, log, () => [])
+    await update($, tdd, () => null)
 
     return next(e)
   })

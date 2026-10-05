@@ -3,6 +3,7 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
 import { applyEdit, chunksOf, unifiedDiff } from '../hooks/diff'
+import { isTestFile } from '../hooks/sides'
 
 const HOME = '/home/dev'
 const SKILL_PATH = `${HOME}/.claude/skills/collaborate/SKILL.md`
@@ -675,6 +676,8 @@ describe('/pair help', () => {
       '/pair on | off',
       '/pair status',
       '/pair summary [note]',
+      '/pair tdd claude [what]',
+      '/pair tdd me [files]',
       '1  Approve',
       '2  Discuss',
       '3  Skip',
@@ -792,6 +795,120 @@ describe('taking over', () => {
     expect(commands).toContainEqual(['git', 'diff', '--no-color', '--no-ext-diff', 'tree1', 'tree2'])
     expect(prompts.at(-1)?.text).toBe('Review the changes I just typed myself (1 file, +1 -1 lines).')
     expect(sent.context?.[0]).toContain('+new')
+  })
+})
+
+describe('TDD mode', () => {
+  test('with Claude on the tests: the command passes on what to test, and Claude hands over with a tool', async ($, on) => {
+    const { clock, prompts, files, commands } = world(on, SOURCE)
+
+    const started = await command($, 'pair', 'tdd claude write a test for pop_all')
+    await clock.advance(100)
+    expect(started.text).toBe('TDD is on: Claude writes the tests, you write the code.')
+    expect(started.context?.[0]).toContain('You write the tests and the user writes the code.')
+    expect(prompts.at(-1)?.text).toBe("Let's do TDD: you write the tests and I write the code. write a test for pop_all")
+
+    const handed = await $.tool.call({ tool: 'mcp__pair__handover', files: 'a.ts' } as never)
+    expect(handed.result).toContain('Handed over.')
+    expect(commands.at(-1)).toEqual([VS_CODE_APP, FILE])
+    expect((await command($, 'pair', 'tdd')).text).toBe(
+      'TDD is on: Claude writes the tests, you write the code. It is your turn.',
+    )
+
+    files[FILE] = 'import x from "x"\nconst count = 1\nconst b = 2\n'
+    const back = await command($, 'pair', 'review does this pass?')
+    await clock.advance(100)
+    expect(prompts.at(-1)?.text).toBe('Here is my code (1 file, +1 -1 lines). does this pass?')
+    expect(back.context?.[0]).toStartWith('pair: TDD round. The user wrote the code below')
+    expect(back.context?.[0]).toContain('propose what to test next and ask')
+    expect(started.context?.[0]).toContain('Only write a test for behaviour the user has agreed to')
+    expect((await command($, 'pair', 'tdd')).text).toContain("It is Claude's turn.")
+  })
+
+  test('with nothing said about what to test, Claude starts from the conversation', async ($, on) => {
+    const { clock, prompts } = world(on, SOURCE)
+
+    await command($, 'pair', 'tdd claude')
+    await clock.advance(100)
+
+    expect(prompts.at(-1)?.text).toEndWith('Start with what we were just discussing.')
+  })
+
+  test('with the user on the tests: starting it takes over at once, and what comes back is a test', async ($, on) => {
+    const { clock, prompts, files, commands } = world(on, SOURCE)
+
+    const started = await command($, 'pair', 'tdd me a.ts')
+    expect(started.text).toStartWith(
+      'TDD is on: you write the tests, Claude writes the code. You are driving: changes to /work/a.ts',
+    )
+    expect(started.text).toContain('/pair review')
+    expect(commands.at(-1)).toEqual([VS_CODE_APP, FILE])
+
+    files[FILE] = 'changed\n'
+    const back = await command($, 'pair', 'review')
+    await clock.advance(100)
+    expect(prompts.at(-1)?.text).toStartWith('Here is my test (1 file,')
+    expect(back.context?.[0]).toStartWith('pair: TDD round. The user wrote the test below')
+  })
+
+  test('Claude can start, swap and stop it with a tool', async ($, on) => {
+    world(on, SOURCE)
+
+    const started = await $.tool.call({ tool: 'mcp__pair__tdd', tests: 'claude' } as never)
+    expect(started.result).toContain('You write the tests and the user writes the code.')
+    expect(started.result).toEndWith('Write the first failing test now.')
+
+    const swapped = await $.tool.call({ tool: 'mcp__pair__tdd', tests: 'swap', files: 'a.ts' } as never)
+    expect(swapped.result).toContain('The user writes the tests and you write the code.')
+    expect((await command($, 'pair', 'tdd')).text).toBe(
+      'TDD is on: you write the tests, Claude writes the code. It is your turn.',
+    )
+
+    await $.tool.call({ tool: 'mcp__pair__tdd', tests: 'off' } as never)
+    expect((await command($, 'pair', 'tdd')).text).toStartWith('TDD is off.')
+  })
+
+  test('turning pair mode off turns TDD off too', async ($, on) => {
+    world(on, SOURCE)
+    await $.tool.call({ tool: 'mcp__pair__tdd', tests: 'claude' } as never)
+
+    const off = await command($, 'pair', 'off')
+
+    expect(off.text).toBe('Pair mode is off. Edits run without review. TDD is off too.')
+    expect(off.context).toContain('pair: the user turned TDD mode off.')
+    expect((await command($, 'pair', 'tdd')).text).toStartWith('TDD is off.')
+    await command($, 'pair', 'on')
+    expect((await command($, 'pair', 'tdd')).text).toStartWith('TDD is off.')
+  })
+
+  test("a review warns when Claude edits a file on the user's side", async ($, on) => {
+    const { clock } = world(on, { ...SOURCE, '/work/a.test.ts': 'old\n' })
+    await command($, 'pair', 'tdd me a.test.ts')
+
+    await explain($, '/work/a.test.ts', 'Tweaks the test.')
+    const offSide = $.tool.call({ tool: 'Edit', file_path: '/work/a.test.ts', old_string: 'old', new_string: 'new' })
+    await clock.settle()
+    const ui = await gatePane($)
+    expect(
+      await ui.find({ type: 'Text', text: 'TDD: you write the tests in this session, and this edits a test file.' }),
+    ).toBeDefined()
+    await ui.press({ key: 'skip' })
+    await offSide
+
+    const { call } = await heldEdit($, clock)
+    await ui.redraw()
+    expect(await ui.find({ type: 'Text', text: /^TDD:/ })).toBeUndefined()
+    await ui.press({ key: 'skip' })
+    await call
+  })
+
+  test('test files are told from code by name and folder', () => {
+    for (const path of ['test_heap.py', 'heap_test.go', 'src/heap.test.ts', 'heap.spec.js', 'tests/heap.py', 'spec/heap_helper.rb']) {
+      expect(isTestFile(path)).toBe(true)
+    }
+    for (const path of ['heap.py', 'src/latest.ts', 'contest/entry.py', 'testing.md', 'inspector.go']) {
+      expect(isTestFile(path)).toBe(false)
+    }
   })
 })
 

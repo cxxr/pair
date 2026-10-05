@@ -9,8 +9,12 @@ export type PairPendingEdit = {
   why: string
   diff: string
   note: string
+  warning: string
   isWide: boolean
 }
+
+// TDD mode: who writes the tests (the other writes the code), and whose turn it is.
+export type PairTdd = { tests: 'claude' | 'user'; turn: 'claude' | 'user' }
 
 export type PairChunk = { path: string; diff: string; added: number; removed: number }
 
@@ -50,6 +54,7 @@ declare module 'claude-code' {
       isGateInBand: boolean
       hasSentInstructions: boolean
       drive: PairDrive | null
+      tdd: PairTdd | null
       touched: string[]
       explanations: Record<string, string>
       tick: number

@@ -77,6 +77,7 @@ A session started anywhere else gets a notebook for that session only, and the m
 - `/pair` flips pair mode.
 - `/pair on` and `/pair off` set it.
 - `/pair status` says which it is and which skill file is in use.
+- `/pair tdd claude|me|swap|off` runs TDD mode; see [TDD mode](#tdd-mode).
 - `/pair summary [note]` has Claude write up the session; see [Session summary](#session-summary).
 - `/pair help` lists every command, review button and setting, with the settings as they currently are.
 
@@ -123,6 +124,19 @@ Naming files is forgiving. A path can be relative to the session's folder, start
 
 The editor is VS Code by default. To use another, set `editor` in `/config` to a command that opens files and returns at once, such as `cursor`, `zed` or `idea`.
 
+### TDD mode
+
+In TDD mode one side writes a failing test and the other writes the code that makes it pass, a round at a time. The sides stay fixed until you swap them.
+
+- `/pair tdd claude [what to test]`: Claude writes the tests and you write the code. Without a note, Claude starts from whatever you were last discussing.
+- `/pair tdd me [files]`: you write the tests and Claude writes the code. You take over at once, as with `/pair drive`.
+- `/pair tdd swap` trades sides, `/pair tdd off` stops, and `/pair tdd` says who is on which side and whose turn it is.
+- Turning pair mode off ends TDD mode too, and turning pair mode back on does not restart it.
+
+You don't have to type any of these. Ask in words, such as "let's do TDD, you write the tests", and Claude starts it with a tool of its own. When Claude's part of a round is done it hands you the keyboard the same way, which opens your editor. The one command that stays yours is `/pair review [note]`, to hand back when you're done; Claude can't tell that for you.
+
+Each round, Claude runs the tests and says plainly whether they pass. If Claude edits a file on your side of the round (a test when you write the tests, or code when Claude does), the review of that edit carries a warning. Files count as tests by name and folder: `test_heap.py`, `heap_test.go`, `heap.spec.ts`, or anything under `tests/`.
+
 ### Session summary
 
 `/pair summary [note]` asks Claude to write up the session: what was decided, what is still open, and what changed, in a form you can paste into a pull request. The mod hands Claude its records to work from: the notebook, and every review of the session with its size and how it ended (approved, skipped, sent back, and so on), including what commands changed and what you typed yourself. Anything after `summary` is passed along as a note, for example `/pair summary keep it to five lines`.
@@ -160,7 +174,7 @@ The instructions go to Claude once per session, with the first prompt you send w
 - Reads the file an edit targets, to draw its diff.
 - Runs `git`, `cp` and your editor command when you use `/pair drive` and `/pair review`. The `git` commands read the repository and write snapshot objects through a temporary index; they do not change your index, branches or files.
 - Runs `mkdir` and `code` when you press Whole file, and `rm -rf` on its own temp folder when you decide an edit you opened that way or when the mod starts and finds leftovers.
-- Lets Claude call the mod's own two tools, `explain_edit` and `notebook`, without a permission prompt. They only change the mod's own session state.
+- Lets Claude call the mod's own tools without a permission prompt. `explain_edit` and `notebook` only change the mod's own state. `tdd` and `handover` start TDD mode and hand you the keyboard, which opens your editor. Claude has no tool for turning pair mode off or for handing back on your behalf.
 
 ## How the hold works
 
