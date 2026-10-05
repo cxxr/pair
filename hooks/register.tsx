@@ -1,7 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { PairCommandReview, PairDrive, PairEntry, PairNotebook, PairPendingEdit } from '../types'
+import type {
+  PairCommandReview,
+  PairDrive,
+  PairEntry,
+  PairLogEntry,
+  PairNotebook,
+  PairPendingEdit,
+} from '../types'
 import { applyEdit, chunksOf, unifiedDiff } from './diff'
 import type { FileDiff } from './diff'
 
@@ -14,7 +21,7 @@ type Kit = Pick<Elements['terminal'], 'Box' | 'Text' | 'Button' | 'Code'>
 // would leave it, with the note its review carries.
 type Whole = { before: string | null; after: string; note: string }
 // What the review draws; `whole` is absent when the edit's target was not found.
-type Described = { text: string; note: string; whole?: Whole }
+type Described = { text: string; note: string; added: number; removed: number; whole?: Whole }
 type HeldCall = Pick<PairPendingEdit, 'id' | 'tool' | 'path'> & {
   describe: () => Promise<Described>
 }
@@ -45,6 +52,22 @@ const REVIEW_BUDGET = 60_000
 const TOUCHED_MAX = 50
 const SUBMIT_DELAY_MS = 100
 const CHUNKS_MAX = 200
+const LOG_MAX = 300
+// How a review of an edit ended, as the session summary words it.
+const OUTCOMES: Record<Decision | 'none', string> = {
+  approve: 'approved',
+  discuss: 'sent back to discuss',
+  skip: 'skipped',
+  split: 'sent back to be split',
+  talk: 'review closed to talk in the chat',
+  release: 'let through when pair mode was turned off',
+  none: 'interrupted before a decision',
+}
+const SUMMARY_RULES =
+  'pair: the user asked for a summary of this session. Write it for someone who was not here: what was decided, what is still open, and what changed, in a form that could be pasted into a pull request description. Use the records below and what you know from the conversation, and say so where the two disagree. Do not change any files.'
+const NOT_STORED = 'not stored'
+const SESSION_ONLY =
+  "This notebook lasts only for this session, because Claude was not started inside a git repository. Start Claude in your project's repository and its notebook is kept from one session to the next."
 // Hidden folders, dependencies and caches are never what the user is typing in.
 const SKIPPED = ['(', '-name', '.*', '-o', '-name', 'node_modules', '-o', '-name', '__pycache__', ')', '-prune']
 const SKILL = 'skills/collaborate/SKILL.md'
@@ -76,8 +99,10 @@ let isBashReviewed = true
 
 const isOn = atom({ plugin: 'pair', key: 'isOn' } as const, true)
 const notebook = atom({ plugin: 'pair', key: 'notebook' } as const, { nextId: 1, entries: [] })
+const notebookName = atom({ plugin: 'pair', key: 'notebookName' } as const, '')
 const pending = atom({ plugin: 'pair', key: 'pending' } as const, [])
 const commands = atom({ plugin: 'pair', key: 'commands' } as const, [])
+const log = atom({ plugin: 'pair', key: 'log' } as const, [])
 const isGateInBand = atom({ plugin: 'pair', key: 'isGateInBand' } as const, false)
 const hasSentInstructions = atom({ plugin: 'pair', key: 'hasSentInstructions' } as const, false)
 const drive = atom({ plugin: 'pair', key: 'drive' } as const, null)
@@ -175,14 +200,78 @@ const formatBook = (book: PairNotebook): string => {
   return `${section('Decided', ofKind(book, 'decided'))}\n${section('Open questions', ofKind(book, 'open'))}`
 }
 
+// The name a session's notebook is stored under: the git repository its
+// project folder is in, worked out once (a shell `cd` does not move it).
+// Undefined outside a repository: a plain folder may hold many projects, and
+// one notebook for all of them would mix their decisions.
+const notebookKey = async ($: EngineInterface): Promise<string | undefined> => {
+  let name = await read($, notebookName)
+  if (name === '') {
+    const top = (await run($, ['git', 'rev-parse', '--show-toplevel'], await $.session.root()))?.trim()
+    name = top === undefined || top === '' ? NOT_STORED : `notebook:${top}`
+    const settled = name
+    await update($, notebookName, () => settled)
+  }
+
+  return name === NOT_STORED ? undefined : name
+}
+
+// What the store holds under that name, when it has the shape of a notebook.
+const asNotebook = (saved: unknown): PairNotebook | undefined => {
+  const book = saved as Partial<PairNotebook> | null | undefined
+  if (typeof book?.nextId !== 'number' || !Array.isArray(book.entries)) {
+    return undefined
+  }
+  const isSound = book.entries.every(
+    (entry: Partial<PairEntry> | null) =>
+      typeof entry?.id === 'number' &&
+      typeof entry.text === 'string' &&
+      (entry.kind === 'decided' || entry.kind === 'open'),
+  )
+
+  return isSound ? { nextId: book.nextId, entries: book.entries } : undefined
+}
+
+// The project's notebook as stored, shown in this session too: another session
+// in the same project may have changed it since this one last looked.
+const refreshNotebook = async ($: EngineInterface): Promise<PairNotebook> => {
+  const key = await notebookKey($)
+  const mine = await read($, notebook)
+  const saved = key === undefined ? undefined : asNotebook(await $.store.get(key))
+  if (key === undefined || saved === undefined) {
+    if (key !== undefined && mine.entries.length > 0) {
+      await $.store.set(key, mine)
+    }
+
+    return mine
+  }
+  if (JSON.stringify(saved) !== JSON.stringify(mine)) {
+    await update($, notebook, () => saved)
+  }
+
+  return saved
+}
+
+// Changes the notebook starting from what is stored now, not from this
+// session's copy, so two sessions adding entries keep each other's.
+const amendNotebook = async ($: EngineInterface, change: (book: PairNotebook) => PairNotebook) => {
+  const amended = change(await refreshNotebook($))
+  const key = await notebookKey($)
+  if (key !== undefined) {
+    await $.store.set(key, amended)
+  }
+
+  return update($, notebook, () => amended)
+}
+
 const changeNotebook = async ($: EngineInterface, request: NotebookRequest): Promise<string> => {
   const { action, id } = request
   const text = request.text?.trim() ?? ''
   if (action === 'list') {
-    return formatBook(await read($, notebook))
+    return formatBook(await refreshNotebook($))
   }
   if (action === 'clear') {
-    return formatBook(await update($, notebook, book => ({ ...book, entries: [] })))
+    return formatBook(await amendNotebook($, book => ({ ...book, entries: [] })))
   }
   if (action === 'decided' || action === 'open') {
     if (text === '') {
@@ -190,16 +279,17 @@ const changeNotebook = async ($: EngineInterface, request: NotebookRequest): Pro
     }
 
     return formatBook(
-      await update($, notebook, book => ({
+      await amendNotebook($, book => ({
         nextId: book.nextId + 1,
         entries: [...book.entries, { id: book.nextId, kind: action, text }],
       })),
     )
   }
 
-  const target = (await read($, notebook)).entries.find(entry => entry.id === id)
+  const stored = await refreshNotebook($)
+  const target = stored.entries.find(entry => entry.id === id)
   if (target === undefined) {
-    return `No notebook entry #${id ?? '?'}.\n${formatBook(await read($, notebook))}`
+    return `No notebook entry #${id ?? '?'}.\n${formatBook(stored)}`
   }
   if (action === 'edit' && text === '') {
     return 'An edit needs the new text.'
@@ -212,7 +302,7 @@ const changeNotebook = async ($: EngineInterface, request: NotebookRequest): Pro
         : { ...target, kind: 'decided', text: text === '' ? target.text : `${target.text} → ${text}` }
 
   return formatBook(
-    await update($, notebook, book => ({
+    await amendNotebook($, book => ({
       ...book,
       entries: book.entries.flatMap(entry => (entry.id !== target.id ? [entry] : changed ? [changed] : [])),
     })),
@@ -628,6 +718,42 @@ const driveChanges = async ($: EngineInterface, started: PairDrive): Promise<Cha
   return changes
 }
 
+// Notes one review for the session summary.
+const record = ($: EngineInterface, entry: PairLogEntry) =>
+  update($, log, list => [...list, entry].slice(-LOG_MAX))
+
+// A prompt in the user's name, sent just after the command that asked for it:
+// a command may not submit one itself. What Claude needs with it travels as
+// that command's hidden note, which the prompt's turn reads.
+const submitSoon = ($: EngineInterface, text: string, failure: string) => {
+  $.clock.after(SUBMIT_DELAY_MS, () => {
+    void $.prompt.submit({ text, asUser: true }).catch(() => {
+      $.ui.toast(failure)
+    })
+  })
+}
+
+const requestSummary = async ($: EngineInterface, note: string) => {
+  const reviews = await read($, log)
+  const records = [
+    SUMMARY_RULES,
+    `Notebook\n${formatBook(await refreshNotebook($))}`,
+    reviews.length === 0
+      ? 'No reviews were recorded this session.'
+      : [
+          'Reviews this session, oldest first',
+          ...reviews.map(one => `- ${one.what}${one.size === '' ? '' : ` (${one.size})`}: ${one.outcome}`),
+        ].join('\n'),
+  ].join('\n\n')
+  submitSoon(
+    $,
+    `Write a summary of this session.${note === '' ? '' : ` ${note}`}`,
+    'Could not ask for the summary. Send any prompt and Claude will have the records.',
+  )
+
+  return { text: 'Asked Claude for a summary of this session.', context: [records] }
+}
+
 const requestReview = async ($: EngineInterface, note: string) => {
   const started = await read($, drive)
   if (started === null) {
@@ -650,14 +776,16 @@ const requestReview = async ($: EngineInterface, note: string) => {
   ]
     .filter(part => part !== '')
     .join('\n\n')
-  const text = `Review the changes I just typed myself (${size}).${note === '' ? '' : ` ${note}`}`
-  // A command may not submit a prompt itself, so a timer does once it is done.
-  // The changes travel as this command's hidden note, which that prompt's turn reads.
-  $.clock.after(SUBMIT_DELAY_MS, () => {
-    void $.prompt.submit({ text, asUser: true }).catch(() => {
-      $.ui.toast('Could not start the review. Send any prompt and Claude will see your changes.')
-    })
+  await record($, {
+    what: `You typed ${plural(changes.files, 'file')}`,
+    size: `+${changes.added} -${changes.removed}`,
+    outcome: 'sent to Claude for review',
   })
+  submitSoon(
+    $,
+    `Review the changes I just typed myself (${size}).${note === '' ? '' : ` ${note}`}`,
+    'Could not start the review. Send any prompt and Claude will see your changes.',
+  )
 
   return { text: `Sent ${size} to Claude for review.`, context: [typed] }
 }
@@ -779,6 +907,18 @@ const reviewCommand = async (
   const flagged = (flags.get(id) ?? []).flatMap(index => entry.chunks[index] ?? [])
   flags.delete(id)
   const size = `${plural(entry.files, 'file')}, +${entry.added} -${entry.removed} lines`
+  await record($, {
+    what: `Bash \`${entry.command}\``,
+    size,
+    outcome:
+      decision === 'talk'
+        ? OUTCOMES.talk
+        : decision !== 'approve'
+          ? 'review not finished'
+          : flagged.length === 0
+            ? 'reviewed'
+            : `reviewed, ${flagged.length} marked to discuss`,
+  })
   if (decision === 'talk') {
     return `pair: the user closed the review of what this command changed (${size}) to talk about it in the main chat. Stop and wait for their message. Do not change or undo those changes yet.`
   }
@@ -801,7 +941,12 @@ const review = async (
   call: HeldCall,
 ): Promise<Verdict> => {
   await update($, touched, list => (list.includes(call.path) ? list : [...list, call.path].slice(-TOUCHED_MAX)))
-  if (!(await read($, isOn)) || (await $.session.surfaces()).length === 0) {
+  if ((await $.session.surfaces()).length === 0) {
+    return {}
+  }
+  if (!(await read($, isOn))) {
+    await record($, { what: `${call.tool} ${call.path}`, size: '', outcome: 'not reviewed, pair mode was off' })
+
     return {}
   }
   const why = (await read($, explanations))[call.path]
@@ -812,7 +957,7 @@ const review = async (
   }
   await update($, explanations, ({ [call.path]: _used, ...rest }) => rest)
 
-  const { text: diff, note, whole } = await call.describe()
+  const { text: diff, note, whole, added, removed } = await call.describe()
   const entry: PairPendingEdit = { id: call.id, tool: call.tool, path: call.path, why, diff, note, isWide: false }
   held.add(call.id)
   if (whole !== undefined) {
@@ -840,6 +985,11 @@ const review = async (
 
   const decision = decisions.get(call.id)
   decisions.delete(call.id)
+  await record($, {
+    what: `${call.tool} ${call.path}`,
+    size: `+${added} -${removed}`,
+    outcome: OUTCOMES[decision ?? 'none'],
+  })
   switch (decision) {
     case 'approve':
       return { note: APPROVED_NOTE }
@@ -877,6 +1027,7 @@ const helpText = (isPairOn: boolean, skillPath: string | undefined): string =>
     '  /pair on | off         set it',
     '  /pair status           say which it is and which skill file is in use',
     '  /pair help             show this',
+    '  /pair summary [note]   have Claude write up the session: decided, still open, and what changed',
     '',
     'When Claude edits (pair mode on)',
     '  Every Edit and Write waits for you in a review showing its reason, size and diff.',
@@ -911,6 +1062,8 @@ const helpText = (isPairOn: boolean, skillPath: string | undefined): string =>
     '  /notebook edit <id> <text>        change an entry',
     '  /notebook remove <id>             delete an entry',
     '  /notebook clear                   delete every entry',
+    '  Kept between sessions, and shared by sessions in the same project, when Claude is started inside a git repository.',
+    '  Started anywhere else, the notebook lasts for that session only.',
     '',
     'Instructions',
     '  The collaborate skill goes to Claude once a session, and again after a compaction or /clear.',
@@ -940,7 +1093,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'pair',
       description: 'Turn pairing mode on or off, or take over the typing and have Claude review it',
-      argumentHint: '[on|off|status|help | drive [files] | review [note]]',
+      argumentHint: '[on|off|status|help | drive [files] | review [note] | summary [note]]',
       immediate: true,
     })
     await $.command.register({
@@ -985,6 +1138,7 @@ export const register: Register = (on, options) => {
     await update($, pending, () => [])
     await update($, commands, () => [])
     await $.ui.close({ id: GATE })
+    await refreshNotebook($).catch(() => undefined)
     await removeCopies($).catch(() => undefined)
 
     return next(e)
@@ -1093,6 +1247,9 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'pair' }, async ($, e) => {
     const [verb = '', ...rest] = e.args.trim().split(/\s+/)
+    if (verb.toLowerCase() === 'summary') {
+      return requestSummary($, e.args.trim().slice(verb.length).trim())
+    }
     if (verb.toLowerCase() === 'help') {
       return { text: helpText(await read($, isOn), (await loadSkill($))?.path) }
     }
@@ -1116,7 +1273,9 @@ export const register: Register = (on, options) => {
       }
     }
     if (word !== '' && word !== 'on' && word !== 'off') {
-      return { text: 'Usage: /pair [on|off|status|help] | drive [files] | review [note]. /pair help explains each.' }
+      return {
+        text: 'Usage: /pair [on|off|status|help] | drive [files] | review [note] | summary [note]. /pair help explains each.',
+      }
     }
 
     const isNowOn = await update($, isOn, was => (word === '' ? !was : word === 'on'))
@@ -1135,8 +1294,9 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'notebook' }, async ($, e) => {
     if (e.args.trim() === '') {
       await $.ui.open({ id: BOOK, title: 'Notebook' })
+      const book = formatBook(await refreshNotebook($))
 
-      return { text: formatBook(await read($, notebook)) }
+      return { text: (await notebookKey($)) === undefined ? `${book}\n\n${SESSION_ONLY}` : book }
     }
     const request = parseNotebookCommand(e.args)
     if (request === undefined) {
@@ -1161,19 +1321,33 @@ export const register: Register = (on, options) => {
 
   on('session.end', async ($, e, next) => {
     await update($, hasSentInstructions, () => false)
+    await update($, log, () => [])
 
     return next(e)
   })
 
   on('prompt.submit', async ($, e, next) => {
     const isPersons = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
+    if (!isPersons || !(await read($, isOn))) {
+      return next(e)
+    }
+    // Another session in the same project may have changed the notebook.
+    const book = await refreshNotebook($).catch(() => undefined)
     // Once a session: sent with every prompt, the copies pile up in the conversation.
-    if (!isPersons || !(await read($, isOn)) || (await read($, hasSentInstructions))) {
+    if (await read($, hasSentInstructions)) {
       return next(e)
     }
     const skill = await loadSkill($)
     $.ui.status(skill === undefined ? 'pair: collaborate skill not found (/pair status)' : undefined)
-    const instructions = skill === undefined ? modNote() : `${skill.body}\n\n${modNote()}`
+    const isKept = (await notebookKey($).catch(() => undefined)) !== undefined
+    if (!isKept) {
+      $.ui.toast('The notebook is for this session only. Start Claude inside a git repository to keep it between sessions.')
+    }
+    const carried =
+      !isKept || book === undefined || book.entries.length === 0
+        ? ''
+        : `\n\nThe notebook you share with the user, kept from earlier sessions in this project:\n${formatBook(book)}`
+    const instructions = `${skill === undefined ? modNote() : `${skill.body}\n\n${modNote()}`}${carried}`
     const entered = await next({ ...e, context: [...(e.context ?? []), instructions] })
     if (entered.drop === undefined) {
       await update($, hasSentInstructions, () => true)
@@ -1199,6 +1373,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: BOOK }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const book = await read($, notebook)
+    const isSessionOnly = (await read($, notebookName)) === NOT_STORED
     const section = (title: string, entries: PairEntry[]) => (
       <Box flexDirection="column" marginBottom={1}>
         <Text bold>{title}</Text>
@@ -1216,6 +1391,7 @@ export const register: Register = (on, options) => {
         {section('Decided', ofKind(book, 'decided'))}
         {section('Open questions', ofKind(book, 'open'))}
         <Text dimColor>/notebook decided|open &lt;text&gt;, resolve|edit &lt;id&gt; &lt;text&gt;, remove &lt;id&gt;</Text>
+        {isSessionOnly && <Text dimColor>{SESSION_ONLY}</Text>}
       </Box>
     )
   })

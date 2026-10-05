@@ -75,6 +75,14 @@ const world = (
       },
     }
   })
+  const stored: Record<string, unknown> = {}
+  on('store.get', (_$, e) => ({ value: stored[e.key] }))
+  on('store.set', (_$, e) => {
+    stored[e.key] = JSON.parse(JSON.stringify(e.value))
+
+    return { value: undefined }
+  })
+  on('session.root', () => ({ value: '/work' }))
   on('session.id', () => ({ value: 'sess' }))
   on('session.cwd', () => ({ value: '/work' }))
   on('session.surfaces', () => ({ value: ['terminal'] as const }))
@@ -97,7 +105,7 @@ const world = (
     return { text: e.text, context: e.context }
   })
 
-  return { clock, ran, prompts, files, commands, opened, asked }
+  return { clock, ran, prompts, files, commands, opened, asked, stored }
 }
 
 const explain = ($: Engine, path: string, summary: string) =>
@@ -666,6 +674,7 @@ describe('/pair help', () => {
     for (const line of [
       '/pair on | off',
       '/pair status',
+      '/pair summary [note]',
       '1  Approve',
       '2  Discuss',
       '3  Skip',
@@ -786,6 +795,60 @@ describe('taking over', () => {
   })
 })
 
+describe('/pair summary', () => {
+  test('hands Claude the notebook and each review, then asks for the write-up', async ($, on) => {
+    const { clock, prompts } = world(on, SOURCE)
+    await notebookTool($, { action: 'add_decided', text: 'Use SQLite' })
+    const first = await heldEdit($, clock)
+    const ui = await gatePane($)
+    await ui.press({ key: 'approve' })
+    await first.call
+    const second = await heldEdit($, clock)
+    await ui.redraw()
+    await ui.press({ key: 'skip' })
+    await second.call
+
+    const sent = await command($, 'pair', 'summary for the pull request')
+    expect(prompts).toHaveLength(0)
+    await clock.advance(100)
+
+    expect(sent.text).toBe('Asked Claude for a summary of this session.')
+    const [records = ''] = sent.context ?? []
+    expect(records).toStartWith('pair: the user asked for a summary of this session.')
+    expect(records).toContain('Notebook\nDecided\n  #1 Use SQLite\nOpen questions\n  (none)')
+    expect(records).toContain(
+      'Reviews this session, oldest first\n- Edit /work/a.ts (+1 -1): approved\n- Edit /work/a.ts (+1 -1): skipped',
+    )
+    expect(prompts.at(-1)?.text).toBe('Write a summary of this session. for the pull request')
+  })
+
+  test('lists command reviews, what the user typed, and edits made with pair mode off', async ($, on) => {
+    const { clock, files } = world(on, { ...SOURCE, '/repo/a.ts': 'x\n' }, true, repository())
+    const { call } = await heldCommand($, clock)
+    await (await gatePane($)).press({ key: 'rest' })
+    await call
+    await command($, 'pair', 'drive /repo/a.ts /elsewhere/z.ts')
+    files['/elsewhere/z.ts'] = 'typed\n'
+    await command($, 'pair', 'review')
+    await command($, 'pair', 'off')
+    await $.tool.call({ tool: 'Edit', file_path: FILE, old_string: 'const a = 1', new_string: 'const count = 1' })
+
+    const [records = ''] = (await command($, 'pair', 'summary')).context ?? []
+
+    expect(records).toContain('- Bash `make fmt` (2 files, +3 -1 lines): reviewed')
+    expect(records).toContain('- You typed 1 file (+1 -0): sent to Claude for review')
+    expect(records).toContain('- Edit /work/a.ts: not reviewed, pair mode was off')
+  })
+
+  test('says so when nothing was reviewed', async ($, on) => {
+    world(on, {})
+
+    const [records = ''] = (await command($, 'pair', 'summary')).context ?? []
+
+    expect(records).toContain('No reviews were recorded this session.')
+  })
+})
+
 describe('notebook', () => {
   test('Claude adds and resolves entries; the person adds, edits and removes them', async ($, on) => {
     world(on, {})
@@ -800,6 +863,50 @@ describe('notebook', () => {
     const listed = await command($, 'notebook', 'remove #2')
     expect(listed.text).toBe('Decided\n  #1 Use Postgres\nOpen questions\n  #3 Which port?')
     expect((await command($, 'notebook', 'resolve 9')).text).toStartWith('No notebook entry #9.')
+  })
+
+  test('in a git repository the notebook is kept: a new session starts with it and tells Claude', async ($, on) => {
+    const { prompts, stored } = world(on, {}, true, repository(true))
+    stored['notebook:/repo'] = {
+      nextId: 3,
+      entries: [
+        { id: 1, kind: 'decided', text: 'Use SQLite' },
+        { id: 2, kind: 'open', text: 'Cache where?' },
+      ],
+    }
+
+    await submit($, 'hello')
+    expect(prompts.at(-1)?.context?.[0]).toContain(
+      'kept from earlier sessions in this project:\nDecided\n  #1 Use SQLite\nOpen questions\n  #2 Cache where?',
+    )
+
+    const listed = await notebookTool($, { action: 'add_decided', text: 'Port 8080' })
+    expect(listed.result).toBe('Decided\n  #1 Use SQLite\n  #3 Port 8080\nOpen questions\n  #2 Cache where?')
+    expect(stored['notebook:/repo']).toMatchObject({ nextId: 4 })
+  })
+
+  test('an entry another session added is kept when this one adds its own', async ($, on) => {
+    const { stored } = world(on, {}, true, repository(true))
+    await notebookTool($, { action: 'add_decided', text: 'Mine' })
+    stored['notebook:/repo'] = {
+      nextId: 3,
+      entries: [
+        { id: 1, kind: 'decided', text: 'Mine' },
+        { id: 2, kind: 'open', text: 'Theirs' },
+      ],
+    }
+
+    const listed = await notebookTool($, { action: 'add_open', text: 'Mine too' })
+
+    expect(listed.result).toBe('Decided\n  #1 Mine\nOpen questions\n  #2 Theirs\n  #3 Mine too')
+  })
+
+  test('outside a git repository nothing is stored, and the notebook says it is for this session only', async ($, on) => {
+    const { stored } = world(on, {})
+    await notebookTool($, { action: 'add_decided', text: 'Use SQLite' })
+
+    expect(stored).toEqual({})
+    expect((await command($, 'notebook')).text).toContain('lasts only for this session')
   })
 
   test('the band is one line when narrow and lists entries when wide', async ($, on) => {

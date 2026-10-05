@@ -68,11 +68,16 @@ To get its reason in front of you, Claude calls a small tool, `explain_edit`, be
 
 Claude adds and resolves entries through its own `notebook` tool.
 
+The notebook is kept from one session to the next when Claude is started inside a git repository. Each repository has its own notebook, stored on your machine outside the project, and sessions open in the same repository share it: an entry added in one appears in the others at their next prompt. At the start of a session Claude is told what the notebook already holds.
+
+A session started anywhere else gets a notebook for that session only, and the mod says so. A plain folder may hold many unrelated projects, and one notebook for all of them would mix their decisions. To keep a notebook, start Claude in your project's repository.
+
 ### The switch
 
 - `/pair` flips pair mode.
 - `/pair on` and `/pair off` set it.
 - `/pair status` says which it is and which skill file is in use.
+- `/pair summary [note]` has Claude write up the session; see [Session summary](#session-summary).
 - `/pair help` lists every command, review button and setting, with the settings as they currently are.
 
 With pair mode off, edits run without review, Claude is told to work as it normally would, and the notebook band is hidden. An edit that is being held when you turn it off goes ahead. The setting lasts for the session; a new session starts with pair mode on.
@@ -117,6 +122,12 @@ How the mod knows what you changed:
 Naming files is forgiving. A path can be relative to the session's folder, start with `~`, or be just a file name: `/pair drive heap.py` looks for a file of that name under the session's folder, near the top first, and tells you if there are several. A leading `@` is ignored, so you can complete a path with the file picker.
 
 The editor is VS Code by default. To use another, set `editor` in `/config` to a command that opens files and returns at once, such as `cursor`, `zed` or `idea`.
+
+### Session summary
+
+`/pair summary [note]` asks Claude to write up the session: what was decided, what is still open, and what changed, in a form you can paste into a pull request. The mod hands Claude its records to work from: the notebook, and every review of the session with its size and how it ended (approved, skipped, sent back, and so on), including what commands changed and what you typed yourself. Anything after `summary` is passed along as a note, for example `/pair summary keep it to five lines`.
+
+The summary appears in the chat. To save it to a file, ask Claude; that write goes through the review like any other.
 
 ### Review size target
 

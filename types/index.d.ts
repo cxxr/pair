@@ -35,13 +35,18 @@ export type PairDrive =
   | { kind: 'git'; root: string; tree: string }
   | { kind: 'files'; files: Record<string, string | null> }
 
+// One review as the session summary lists it: what was reviewed, how big, and how it ended.
+export type PairLogEntry = { what: string; size: string; outcome: string }
+
 declare module 'claude-code' {
   interface PluginState {
     pair: {
       isOn: boolean
       notebook: PairNotebook
+      notebookName: string
       pending: PairPendingEdit[]
       commands: PairCommandReview[]
+      log: PairLogEntry[]
       isGateInBand: boolean
       hasSentInstructions: boolean
       drive: PairDrive | null
