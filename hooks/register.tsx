@@ -1197,7 +1197,8 @@ const helpText = (isPairOn: boolean, skillPath: string | undefined): string =>
     '  With no files: everything in the git repository, or outside one the files Claude has edited.',
     '',
     'Notebook',
-    '  /notebook                         show it in a pane',
+    '  /notebook                         show it in a pane; run it again to close the pane',
+    '  /notebook close                   close the pane; Esc and the ✕ on the pane close it too',
     '  /notebook decided <text>          add a decision',
     '  /notebook open <text>             add an open question',
     '  /notebook resolve <id> [answer]   move a question to Decided',
@@ -1506,8 +1507,14 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'notebook' }, async ($, e) => {
+    const isOpen = (await $.ui.panes()).some(pane => pane.id === BOOK)
+    if (e.args.trim() === 'close' || (e.args.trim() === '' && isOpen)) {
+      await $.ui.close({ id: BOOK })
+
+      return { text: 'Notebook pane closed.' }
+    }
     if (e.args.trim() === '') {
-      await $.ui.open({ id: BOOK, title: 'Notebook' })
+      await $.ui.open({ id: BOOK, title: 'Notebook', closeOnEscape: true })
       const book = formatBook(await refreshNotebook($))
 
       return { text: (await notebookKey($)) === undefined ? `${book}\n\n${SESSION_ONLY}` : book }
@@ -1515,7 +1522,7 @@ export const register: Register = (on, options) => {
     const request = parseNotebookCommand(e.args)
     if (request === undefined) {
       return {
-        text: 'Usage: /notebook | decided <text> | open <text> | resolve <id> [answer] | edit <id> <text> | remove <id> | clear',
+        text: 'Usage: /notebook | close | decided <text> | open <text> | resolve <id> [answer] | edit <id> <text> | remove <id> | clear',
       }
     }
 
@@ -1586,7 +1593,7 @@ export const register: Register = (on, options) => {
   })
 
   on('ui.render', { component: 'Pane', requestId: BOOK }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
     const book = await read($, notebook)
     const isSessionOnly = (await read($, notebookName)) === NOT_STORED
     const section = (title: string, entries: PairEntry[]) => (
@@ -1603,9 +1610,13 @@ export const register: Register = (on, options) => {
 
     return (
       <Box flexDirection="column">
+        <Box justifyContent="flex-end">
+          <Button key="close" plain role="dismiss" label="✕ Close" onPress={() => $.ui.close({ id: BOOK })} />
+        </Box>
         {section('Decided', ofKind(book, 'decided'))}
         {section('Open questions', ofKind(book, 'open'))}
         <Text dimColor>/notebook decided|open &lt;text&gt;, resolve|edit &lt;id&gt; &lt;text&gt;, remove &lt;id&gt;</Text>
+        <Text dimColor>Close with ✕, Esc, or /notebook again.</Text>
         {isSessionOnly && <Text dimColor>{SESSION_ONLY}</Text>}
       </Box>
     )

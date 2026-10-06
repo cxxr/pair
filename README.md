@@ -61,7 +61,7 @@ To get its reason in front of you, Claude calls a small tool, `explain_edit`, be
 ### The notebook
 
 - A band above the prompt shows the notebook: one line when the terminal is narrow, the latest entries when it is wide.
-- `/notebook` opens the full list in a pane.
+- `/notebook` opens the full list in a pane. To close it, run `/notebook` again, run `/notebook close`, press Esc while the pane has the keyboard, or press ✕ Close at its top right.
 - `/notebook decided <text>` and `/notebook open <text>` add an entry.
 - `/notebook resolve <id> [answer]` moves an open question to Decided.
 - `/notebook edit <id> <text>`, `/notebook remove <id>` and `/notebook clear` change or delete entries.

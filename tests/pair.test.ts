@@ -87,12 +87,27 @@ const world = (
   on('session.id', () => ({ value: 'sess' }))
   on('session.cwd', () => ({ value: '/work' }))
   on('session.surfaces', () => ({ value: ['terminal'] as const }))
+  const panes = new Set<string>()
+  const closesOnEscape = new Set<string>()
   on('ui.open', (_$, e) => {
     opened.push({ columns: e.columns })
+    if (isPanePlaced) {
+      panes.add(e.id)
+    }
+    if (e.closeOnEscape === true) {
+      closesOnEscape.add(e.id)
+    }
 
     return { value: isPanePlaced ? { isPlaced: true } : { isPlaced: false, reason: 'narrow' } }
   })
-  on('ui.close', () => ({ value: undefined }))
+  on('ui.close', (_$, e) => {
+    panes.delete(e.id)
+
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({
+    value: [...panes].map(id => ({ id, title: id, isShown: true, isFocused: false, isPlaced: true })),
+  }))
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
   on('tool.call', (_$, e) => {
@@ -106,7 +121,7 @@ const world = (
     return { text: e.text, context: e.context }
   })
 
-  return { clock, ran, prompts, files, commands, opened, asked, stored }
+  return { clock, ran, prompts, files, commands, opened, asked, stored, panes, closesOnEscape }
 }
 
 const explain = ($: Engine, path: string, summary: string) =>
@@ -1041,6 +1056,36 @@ describe('notebook', () => {
       expect(await wide.find({ type: 'Text', text: /Use SQLite/ })).toBeDefined()
       expect(await wide.find({ type: 'Text', text: /Cache where\?/ })).toBeDefined()
       await wide.unmount()
+    }
+  })
+
+  test('the notebook pane closes with /notebook again, /notebook close, or its close control, and Esc is asked to close it', async ($, on) => {
+    const { panes, closesOnEscape } = world(on, {})
+
+    await command($, 'notebook')
+    expect(panes.has('pair-notebook')).toBe(true)
+    expect(closesOnEscape.has('pair-notebook')).toBe(true)
+    expect((await command($, 'notebook')).text).toBe('Notebook pane closed.')
+    expect(panes.has('pair-notebook')).toBe(false)
+
+    await command($, 'notebook')
+    expect((await command($, 'notebook', 'close')).text).toBe('Notebook pane closed.')
+    expect(panes.has('pair-notebook')).toBe(false)
+
+    await command($, 'notebook')
+    for (const surface of ['terminal', 'desktop'] as const) {
+      const ui = await $.ui.mount({
+        plugin: 'pair',
+        surface,
+        component: 'Pane',
+        requestId: 'pair-notebook',
+        props: { ...PANE, title: 'Notebook' },
+      })
+      expect((await ui.find({ type: 'Button', key: 'close' }))?.props.role).toBe('dismiss')
+      await ui.press({ key: 'close' })
+      expect(panes.has('pair-notebook')).toBe(false)
+      await ui.unmount()
+      await command($, 'notebook')
     }
   })
 
