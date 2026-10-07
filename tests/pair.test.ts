@@ -947,6 +947,7 @@ describe('/pair summary', () => {
     expect(sent.text).toBe('Asked Claude for a summary of this session.')
     const [records = ''] = sent.context ?? []
     expect(records).toStartWith('pair: the user asked for a summary of this session.')
+    expect(records).toContain('suggesting the user run /code-review before they commit')
     expect(records).toContain('Notebook\nDecided\n  #1 Use SQLite\nOpen questions\n  (none)')
     expect(records).toContain(
       'Reviews this session, oldest first\n- Edit /work/a.ts (+1 -1): approved\n- Edit /work/a.ts (+1 -1): skipped',

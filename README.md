@@ -141,7 +141,7 @@ Each round, Claude runs the tests and says plainly whether they pass. If Claude 
 
 `/pair summary [note]` asks Claude to write up the session: what was decided, what is still open, and what changed, in a form you can paste into a pull request. The mod hands Claude its records to work from: the notebook, and every review of the session with its size and how it ended (approved, skipped, sent back, and so on), including what commands changed and what you typed yourself. Anything after `summary` is passed along as a note, for example `/pair summary keep it to five lines`.
 
-The summary appears in the chat. To save it to a file, ask Claude; that write goes through the review like any other.
+The summary appears in the chat, and ends by suggesting `/code-review`, Claude Code's own careful review of a finished change, before you commit. To save it to a file, ask Claude; that write goes through the review like any other.
 
 ### Review size target
 

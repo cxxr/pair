@@ -68,7 +68,7 @@ const OUTCOMES: Record<Decision | 'none', string> = {
 const TDD_USAGE =
   'TDD is off. /pair tdd claude [what to test]: Claude writes the tests and you write the code. /pair tdd me [files]: you write the tests and Claude writes the code.'
 const SUMMARY_RULES =
-  'pair: the user asked for a summary of this session. Write it for someone who was not here: what was decided, what is still open, and what changed, in a form that could be pasted into a pull request description. Use the records below and what you know from the conversation, and say so where the two disagree. Do not change any files.'
+  'pair: the user asked for a summary of this session. Write it for someone who was not here: what was decided, what is still open, and what changed, in a form that could be pasted into a pull request description. Use the records below and what you know from the conversation, and say so where the two disagree. Do not change any files. After the summary, add one line suggesting the user run /code-review before they commit, for a careful check of the finished change.'
 const NOT_STORED = 'not stored'
 const SESSION_ONLY =
   "This notebook lasts only for this session, because Claude was not started inside a git repository. Start Claude in your project's repository and its notebook is kept from one session to the next."
