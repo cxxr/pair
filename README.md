@@ -81,7 +81,7 @@ A session started anywhere else gets a notebook for that session only, and the m
 - `/pair summary [note]` has Claude write up the session; see [Session summary](#session-summary).
 - `/pair help` lists every command, review button and setting, with the settings as they currently are.
 
-With pair mode off, edits run without review, Claude is told to work as it normally would, and the notebook band is hidden. An edit that is being held when you turn it off goes ahead. The setting lasts for the session; a new session starts with pair mode on.
+With pair mode off, edits run without review, Claude is told to work as it normally would, and the notebook band is hidden. An edit that is being held when you turn it off goes ahead. The setting lasts for the session. A new session starts with pair mode on, unless you set `startOn` to off in `/config`.
 
 ### When a command changes files
 

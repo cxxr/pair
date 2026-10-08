@@ -680,6 +680,27 @@ describe('what a command changed', () => {
   })
 })
 
+describe('starting off', () => {
+  test('with startOn off a session starts with pair mode off, and /pair still turns it on', { options: { startOn: false } }, async ($, on) => {
+    const { ran } = world(on, SOURCE)
+    on('session.start', (_$, e) => ({ cwd: e.cwd }))
+    on('command.register', (_$, e) => ({ value: { command: e.name } }))
+    on('tool.register', (_$, e) => ({ value: { tool: `mcp__pair__${e.name}` } }))
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+
+    expect((await command($, 'pair', 'status')).text).toBe('Pair mode is off.')
+    expect(
+      await $.tool.call({ tool: 'Edit', file_path: FILE, old_string: 'const a = 1', new_string: 'const count = 1' }),
+    ).toMatchObject({ result: 'ran' })
+    expect(ran.filter(e => e.tool === 'Edit')).toHaveLength(1)
+
+    await command($, 'pair', 'on')
+    await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+    expect((await command($, 'pair', 'status')).text).toMatch(/^Pair mode is on/)
+    expect((await command($, 'pair', 'help')).text).toContain('Start in pair mode     off (startOn)')
+  })
+})
+
 describe('/pair help', () => {
   test('lists every command and button, and the settings as they are', { options: { maxReviewLines: 12, editor: 'zed' } }, async ($, on) => {
     world(on, { [SKILL_PATH]: SKILL_TEXT })

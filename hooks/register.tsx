@@ -1151,7 +1151,7 @@ const review = async (
   }
 }
 
-const helpText = (isPairOn: boolean, skillPath: string | undefined): string =>
+const helpText = (isPairOn: boolean, skillPath: string | undefined, startsOn: boolean): string =>
   [
     `Pair programming with Claude. Pair mode is ${isPairOn ? 'on' : 'off'}.`,
     '',
@@ -1217,6 +1217,7 @@ const helpText = (isPairOn: boolean, skillPath: string | undefined): string =>
     `  Review size target     ${maxLines} changed lines (maxReviewLines)`,
     `  Editor command         ${editor} (editor)`,
     `  Review command changes ${isBashReviewed ? 'on' : 'off'} (reviewBash)`,
+    `  Start in pair mode     ${startsOn ? 'on' : 'off'} (startOn)`,
     '',
     'Only Edit and Write are held. Bash and other tools can still change files.',
   ].join('\n')
@@ -1231,6 +1232,7 @@ export const register: Register = (on, options) => {
   if (typeof options.reviewBash === 'boolean') {
     isBashReviewed = options.reviewBash
   }
+  const startsOn = options.startOn !== false
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -1311,6 +1313,11 @@ export const register: Register = (on, options) => {
         required: ['file_path', 'summary'],
       },
     })
+    // Only a session's first start sets the mode: a reload keeps what the user chose.
+    const mode = await $.state.get({ plugin: 'pair', key: 'isOn' } as const)
+    if (mode.version === 0 && !startsOn) {
+      await update($, isOn, () => false)
+    }
     // No hold outlives the module that ran it.
     await update($, pending, () => [])
     await update($, commands, () => [])
@@ -1458,7 +1465,7 @@ export const register: Register = (on, options) => {
       return requestSummary($, e.args.trim().slice(verb.length).trim())
     }
     if (verb.toLowerCase() === 'help') {
-      return { text: helpText(await read($, isOn), (await loadSkill($))?.path) }
+      return { text: helpText(await read($, isOn), (await loadSkill($))?.path, startsOn) }
     }
     if (verb.toLowerCase() === 'drive') {
       return startDrive($, rest.join(' '))
